@@ -410,6 +410,10 @@ def _is_backend_available(backend: str) -> bool:
             return has_xai_credentials()
         except Exception:
             return False
+    if backend == "scraper":
+        # Dark Island local scraper — extract-only, no API key needed.
+        # The service is checked lazily at first extract call.
+        return True
     return False
 
 

@@ -600,6 +600,13 @@ from hermes_constants import get_hermes_dir as _get_hermes_dir
 _STORE_DIR = _get_hermes_dir("platforms/matrix/store", "matrix/store")
 _CRYPTO_DB_PATH = _STORE_DIR / "crypto.db"
 
+# ONE shared mautrix Database pool per crypto store path, process-wide.
+# The gateway adapter owns the pool it started; ephemeral adapters
+# (`hermes send` CLI, standalone cron fallback) BORROW it instead of
+# creating a second pool against the same single-writer SQLite file.
+# Keyed by resolved store path so per-profile paths stay independent.
+_SHARED_CRYPTO_DB_POOL: dict[str, Any] = {}
+
 # Grace period: ignore messages older than this many seconds before startup.
 _STARTUP_GRACE_SECONDS = 5
 
@@ -759,11 +766,26 @@ def _create_matrix_session(proxy_url: str | None):
     we use ``aiohttp_socks.ProxyConnector`` (connector-level).
     When no proxy is configured we enable ``trust_env`` so standard env vars
     (``HTTP_PROXY`` / ``HTTPS_PROXY``) are honoured automatically.
+
+    NOTE: We explicitly set ``timeout=aiohttp.ClientTimeout(total=None)`` to
+    DISABLE aiohttp's built-in ClientTimeout.  The timeout context manager
+    requires a running asyncio Task, but cron job deliveries schedule onto the
+    gateway event loop via ``run_coroutine_threadsafe`` — under certain timing
+    conditions ``asyncio.current_task()`` returns None inside the CM's
+    ``__enter__``, raising ``RuntimeError: Timeout context manager should be
+    used inside a task``.  The Matrix adapter's ``send()`` method already wraps
+    sends in ``asyncio.wait_for(timeout=45)`` which provides the timeout without
+    requiring the aiohttp CM.  This mirrors the fix applied to the WeChat
+    platform adapter for the same class of error.
     """
     import aiohttp
 
+    # Disable aiohttp's ClientTimeout to avoid "Timeout context manager should
+    # be used inside a task" errors when invoked from cron delivery threads.
+    _no_timeout = aiohttp.ClientTimeout(total=None)
+
     if not proxy_url:
-        return aiohttp.ClientSession(trust_env=True)
+        return aiohttp.ClientSession(trust_env=True, timeout=_no_timeout)
 
     if proxy_url.split("://")[0].lower().startswith("socks"):
         try:
@@ -771,6 +793,7 @@ def _create_matrix_session(proxy_url: str | None):
 
             return aiohttp.ClientSession(
                 connector=ProxyConnector.from_url(proxy_url, rdns=True),
+                timeout=_no_timeout,
             )
         except ImportError:
             logger.warning(
@@ -778,9 +801,9 @@ def _create_matrix_session(proxy_url: str | None):
                 "Run: pip install aiohttp-socks",
                 proxy_url,
             )
-            return aiohttp.ClientSession(trust_env=True)
+            return aiohttp.ClientSession(trust_env=True, timeout=_no_timeout)
 
-    return aiohttp.ClientSession(proxy=proxy_url)
+    return aiohttp.ClientSession(proxy=proxy_url, timeout=_no_timeout)
 
 
 def _check_e2ee_deps() -> bool:
@@ -1668,13 +1691,31 @@ class MatrixAdapter(BasePlatformAdapter):
 
         if server_ed25519 != local_ed25519:
             if olm.account.shared:
-                logger.error(
+                # DARK ISLAND PATCH: Server has different identity keys than
+                # our local store, but the account was already shared. This
+                # happens when the server rotates/replaces device keys
+                # out-of-band. Rather than refusing to connect (which bricks
+                # comms after a restart), log a warning and proceed — the
+                # OlmMachine operates with degraded trust exactly as it did
+                # before the restart. Cross-signing via recovery key still
+                # runs below. Also re-upload one-time keys so we can respond
+                # to m.room_key_request events from newly-logged-in devices.
+                logger.warning(
                     "Matrix: server has different identity keys for device %s — "
-                    "local crypto state is stale. Delete %s and restart.",
+                    "proceeding with degraded trust (local ed25519 != server). "
+                    "Re-uploading one-time keys for key sharing.",
                     client.device_id,
-                    _CRYPTO_DB_PATH,
                 )
-                return False
+                try:
+                    await olm.share_keys()
+                except Exception as key_exc:
+                    logger.warning(
+                        "Matrix: one-time key upload failed in degraded-trust "
+                        "path for device %s: %s",
+                        client.device_id,
+                        key_exc,
+                    )
+                return True
 
             logger.warning(
                 "Matrix: server has stale keys for device %s — attempting re-upload",
@@ -1918,8 +1959,28 @@ class MatrixAdapter(BasePlatformAdapter):
                         f"sqlite:///{_CRYPTO_DB_PATH}",
                         upgrade_table=PgCryptoStore.upgrade_table,
                     )
-                    await crypto_db.start()
-                    self._crypto_db = crypto_db
+                    # Share ONE Database pool per store path across every
+                    # adapter instance in this process (gateway adapter + any
+                    # ephemeral `hermes send` / send_message tool fallback).
+                    # mautrix's Database lacks a registry, so key on the
+                    # resolved store path on the module. This prevents two
+                    # pools from racing on the same single-writer SQLite file
+                    # and lets disconnect() below know whether it OWNS the
+                    # pool (must stop) or merely BORROWED it (must not).
+                    _shared = _SHARED_CRYPTO_DB_POOL.get(str(_CRYPTO_DB_PATH))
+                    if _shared is None:
+                        await crypto_db.start()
+                        _SHARED_CRYPTO_DB_POOL[str(_CRYPTO_DB_PATH)] = crypto_db
+                        self._owns_crypto_db = True
+                        self._crypto_db = crypto_db
+                    else:
+                        self._owns_crypto_db = False
+                        self._crypto_db = _shared
+                    logger.debug(
+                        "Matrix: crypto store pool %s (owns=%s)",
+                        _CRYPTO_DB_PATH,
+                        self._owns_crypto_db,
+                    )
 
                     _acct_id = self._user_id or "hermes"
                     # Use the resolved client.device_id (from whoami or password
@@ -2173,10 +2234,18 @@ class MatrixAdapter(BasePlatformAdapter):
 
         # Close the SQLite crypto store database.
         if hasattr(self, "_crypto_db") and self._crypto_db:
-            try:
-                await self._crypto_db.stop()
-            except Exception as exc:
-                logger.debug("Matrix: could not close crypto DB on disconnect: %s", exc)
+            if getattr(self, "_owns_crypto_db", True):
+                try:
+                    await self._crypto_db.stop()
+                except Exception as exc:
+                    logger.debug("Matrix: could not close crypto DB on disconnect: %s", exc)
+            else:
+                # Borrowed the shared pool (gateway adapter, or an ephemeral
+                # adapter that found the gateway's live connection). Stopping
+                # it here would kill the pool the gateway is actively reading
+                # from — the "unable to decrypt" / "database pool has been
+                # stopped" bug. Leave it for the owner to stop.
+                logger.debug("Matrix: borrowed crypto store pool — not stopping on disconnect")
 
         if self._client:
             try:
@@ -2463,12 +2532,21 @@ class MatrixAdapter(BasePlatformAdapter):
             async with _aiohttp.ClientSession(**_sess_kw) as http:
                 fetch_url = url
                 for _ in range(20):
-                    async with http.get(
-                        fetch_url,
-                        timeout=_aiohttp.ClientTimeout(total=30),
-                        allow_redirects=False,
-                        **_req_kw,
-                    ) as resp:
+                    # Use asyncio.wait_for for timeout instead of aiohttp
+                    # ClientTimeout to avoid "Timeout context manager should
+                    # be used inside a task" errors from cron delivery threads.
+                    async def _fetch():
+                        return await http.get(
+                            fetch_url,
+                            timeout=None,
+                            allow_redirects=False,
+                            **_req_kw,
+                        )
+                    try:
+                        resp = await asyncio.wait_for(_fetch(), timeout=30)
+                    except asyncio.TimeoutError:
+                        raise
+                    async with resp:
                         if resp.status in {301, 302, 303, 307, 308}:
                             location = resp.headers.get("Location")
                             if not location:
@@ -3088,10 +3166,14 @@ class MatrixAdapter(BasePlatformAdapter):
                     or "403" in err_str
                     or "unauthorized" in err_str
                     or "forbidden" in err_str
+                    or "m_unknown" in err_str
+                    or "unknown_token" in err_str
+                    or "introspect" in err_str
                 ):
                     logger.error(
                         "Matrix: permanent auth error: %s — stopping sync", exc
                     )
+                    self._mark_disconnected()
                     return
                 logger.warning("Matrix: sync error: %s — retrying in 5s", exc)
                 await asyncio.sleep(5)

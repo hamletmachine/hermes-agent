@@ -2015,6 +2015,40 @@ async def _send_matrix_via_adapter(pconfig, chat_id, message, media_files=None, 
             live_adapter, chat_id, message, media_files, metadata
         )
 
+    # When a gateway runner EXISTS but the live adapter is unavailable
+    # (lookup race, mid-restart, multiplex startup), we must NOT silently drop
+    # to the ephemeral path — that constructs a SECOND OlmMachine/olm account
+    # against the SAME shared crypto.db the gateway owns and, on disconnect(),
+    # stops the pool the gateway is reading from (cron LLM "unable to decrypt"
+    # reports). Retry the live lookup briefly; only a true standalone process
+    # (no gateway) may use the ephemeral adapter.
+    if runner is not None:
+        for _attempt in range(5):
+            await asyncio.sleep(1.0)
+            try:
+                from gateway.config import Platform
+                live_adapter = runner.adapters.get(Platform.MATRIX)
+            except Exception:
+                live_adapter = None
+            if live_adapter is not None:
+                logger.warning(
+                    "Matrix: live gateway adapter recovered after retry — "
+                    "using persistent session (avoids ephemeral E2EE re-init "
+                    "on the shared store, #46310)"
+                )
+                return await _matrix_send_core(
+                    live_adapter, chat_id, message, media_files, metadata
+                )
+        logger.error(
+            "Matrix: gateway runner present but live adapter unavailable after "
+            "5 retries — refusing ephemeral fallback on the shared crypto "
+            "store. Standalone (no-gateway) contexts are unaffected."
+        )
+        return _error(
+            "Matrix live adapter unavailable (gateway is up but matrix adapter "
+            "not ready). Retry shortly."
+        )
+
     # --- Fallback: ephemeral adapter (standalone / cron context) ---
     try:
         from plugins.platforms.matrix.adapter import MatrixAdapter

@@ -3813,6 +3813,70 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
+            # When a live adapter EXISTS but no running loop is visible from
+            # this cron worker thread (safe_schedule_threadsafe returns None),
+            # give the loop a bounded chance to become schedulable before
+            # dropping to the standalone path. The standalone path constructs
+            # an EPHEMERAL MatrixAdapter against the SAME shared crypto.db and
+            # on disconnect() stops the gateway's pool — the direct cause of
+            # LLM-cron "unable to decrypt" reports. Retrying the live send
+            # keeps script AND LLM deliveries on the gateway's persistent
+            # session (the Red Aug-11 principle: same store, same device).
+            #
+            # NOTE: this function is SYNC (runs on a cron worker thread), so
+            # the retry uses time.sleep — not asyncio.sleep. All local route
+            # vars are re-derived here because the earlier live block that
+            # defines them was skipped (live_adapter_ready was False).
+            if runtime_adapter is not None and loop is not None:
+                _live_retried = False
+                from gateway.delivery import DeliveryRouter as _RetryRouter
+                from gateway.delivery import DeliveryTarget as _RetryTargetCls
+                _retry_text = cleaned_delivery_content.strip()
+                _retry_route_metadata = {"job_id": job.get("id", "")}
+                _retry_target = _RetryTargetCls(
+                    platform=platform,
+                    chat_id=str(chat_id),
+                    thread_id=route_thread_id if "route_thread_id" in dir() else None,
+                    is_explicit=True,
+                )
+                for _attempt in range(5):
+                    try:
+                        if getattr(loop, "is_running", lambda: False)():
+                            _live_retried = True
+                            _retry_router = _RetryRouter(config, adapters)
+                            _retry_future = safe_schedule_threadsafe(
+                                _retry_router._deliver_to_platform(
+                                    _retry_target,
+                                    _retry_text,
+                                    _retry_route_metadata,
+                                ),
+                                loop,
+                            )
+                            if _retry_future is not None:
+                                _retry_result = _retry_future.result(timeout=60)
+                                if _retry_result and not getattr(_retry_result, "error", None):
+                                    logger.info(
+                                        "Job '%s': delivered to %s:%s via live adapter "
+                                        "(post-retry)",
+                                        job["id"], platform_name, chat_id,
+                                    )
+                                    delivered = True
+                                    break
+                    except Exception as _live_err:
+                        logger.debug(
+                            "Job '%s': live delivery retry %d failed: %s",
+                            job["id"], _attempt + 1, _live_err,
+                        )
+                    time.sleep(1.0)
+                if delivered:
+                    target_errors.clear()
+                    continue
+                if _live_retried:
+                    logger.warning(
+                        "Job '%s': live adapter retries exhausted for %s:%s — "
+                        "falling back to standalone send",
+                        job["id"], platform_name, chat_id,
+                    )
             coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
             try:
                 result = asyncio.run(coro)
