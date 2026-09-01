@@ -22,6 +22,8 @@ import {
   $activeSessionId,
   $connection,
   $currentCwd,
+  $currentModel,
+  $currentProvider,
   $selectedStoredSessionId,
   $sessions,
   $unreadFinishedSessionIds,
@@ -31,10 +33,12 @@ import {
   commitWorkspaceCwdForSelectedSession,
   ensureDefaultWorkspaceCwd,
   forgetSessionOwnerHintsForConnection,
+  forgetSessionOwnerHintsForSession,
   getConfiguredDefaultProjectDir,
   getRememberedRoute,
   getRememberedSessionId,
   getSessionOwnerHint,
+  getSessionOwnerHints,
   hydrateSessionOwnerHints,
   knownSessionOwner,
   knownSessionProfile,
@@ -42,9 +46,15 @@ import {
   rememberedSessionProfile,
   resolveComposerSessionKey,
   sessionBelongsToProfile,
+  sessionOwnerRouteFromRow,
   sessionPinId,
+  setComposerSelectionOwner,
+  setConnection,
   setCurrentCwd,
   setCurrentCwdTransient,
+  setCurrentModel,
+  setCurrentModelSource,
+  setCurrentProvider,
   setRememberedRoute,
   setRememberedSessionId,
   setSelectedStoredSessionId,
@@ -62,6 +72,83 @@ import {
 } from './session-states'
 
 const session = (over: Partial<SessionInfo>): SessionInfo => makeSessionInfo({ id: 'live', ...over })
+
+describe('composer model persistence scope', () => {
+  const local = { baseUrl: '', connectionId: 'local', mode: 'local' } as never
+
+  beforeEach(() => {
+    window.localStorage.clear()
+    setConnection(local)
+    setCurrentModel('')
+    setCurrentProvider('')
+    setCurrentModelSource('')
+  })
+
+  afterEach(() => {
+    setConnection(local)
+    window.localStorage.clear()
+  })
+
+  it('keeps manual model selections isolated by remote connection and profile', () => {
+    const remote = (profile: string) =>
+      ({ baseUrl: 'https://aibox.example', connectionId: 'aibox', mode: 'remote', profile }) as never
+
+    setConnection(remote('fred'))
+    setCurrentModel('grok-4')
+    setCurrentProvider('xai-oauth')
+    setCurrentModelSource('manual')
+
+    setConnection(remote('fred-work'))
+    expect($currentModel.get()).toBe('')
+    expect($currentProvider.get()).toBe('')
+
+    setCurrentModel('local/model')
+    setCurrentProvider('custom:local')
+    setConnection(remote('fred'))
+
+    expect($currentModel.get()).toBe('grok-4')
+    expect($currentProvider.get()).toBe('xai-oauth')
+  })
+
+  it('keeps inferred local-primary connections on the historical bare keys', () => {
+    setComposerSelectionOwner('remote', 'default')
+    window.localStorage.setItem('hermes.desktop.composer.model', 'legacy-model')
+    window.localStorage.setItem('hermes.desktop.composer.provider', 'legacy-provider')
+
+    setConnection({ baseUrl: '', connectionId: 'local', mode: 'local', profile: 'default' } as never)
+
+    expect($currentModel.get()).toBe('legacy-model')
+    expect($currentProvider.get()).toBe('legacy-provider')
+    setCurrentModel('next-model')
+    expect(window.localStorage.getItem('hermes.desktop.composer.model')).toBe('next-model')
+    expect(window.localStorage.getItem('hermes.desktop.composer.model.registry.local.default')).toBeNull()
+  })
+
+  it('uses the live registry owner when the connection descriptor is stale', () => {
+    const remote = (profile: string) =>
+      ({ baseUrl: 'https://aibox.example', connectionId: 'aibox', mode: 'remote', profile }) as never
+
+    setConnection(remote('fred'))
+    setCurrentModel('grok-4')
+    setCurrentProvider('xai-oauth')
+    setCurrentModelSource('manual')
+
+    // ensureGatewayAgent publishes this coordinate even if getConnectionFor
+    // fails and $connection therefore still describes fred.
+    setComposerSelectionOwner('aibox', 'fred-work')
+    setCurrentModel('local/model')
+    setCurrentProvider('custom:local')
+    setCurrentModelSource('default')
+
+    setComposerSelectionOwner('aibox', 'fred')
+    expect($currentModel.get()).toBe('grok-4')
+    expect($currentProvider.get()).toBe('xai-oauth')
+
+    setComposerSelectionOwner('aibox', 'fred-work')
+    expect($currentModel.get()).toBe('local/model')
+    expect($currentProvider.get()).toBe('custom:local')
+  })
+})
 
 describe('session owner hints', () => {
   afterEach(() => {
@@ -175,6 +262,32 @@ describe('session owner hints', () => {
     hydrateSessionOwnerHints()
     expect(getSessionOwnerHint('stored-a')).toBeUndefined()
     expect(getSessionOwnerHint('stored-c')).toEqual({ connectionId: 'local', profile: 'omar' })
+  })
+
+  it('forgets every route for one session without disturbing other sessions', () => {
+    setSessionOwnerHint('poisoned', { connectionId: 'local', mode: 'local', profile: 'default' })
+    setSessionOwnerHint('poisoned', { connectionId: 'remote-a', mode: 'remote', profile: 'default' })
+    setSessionOwnerHint('healthy', { connectionId: 'remote-a', mode: 'remote', profile: 'default' })
+
+    forgetSessionOwnerHintsForSession('poisoned')
+
+    expect(getSessionOwnerHints('poisoned')).toEqual([])
+    expect(getSessionOwnerHint('healthy')).toMatchObject({ connectionId: 'remote-a' })
+
+    _resetSessionOwnerHintsForTests()
+    hydrateSessionOwnerHints()
+    expect(getSessionOwnerHints('poisoned')).toEqual([])
+    expect(getSessionOwnerHint('healthy')).toMatchObject({ connectionId: 'remote-a' })
+  })
+
+  it('pins only connection-tagged rows and leaves primary SSH rows ambient', () => {
+    expect(sessionOwnerRouteFromRow(session({ connection_id: 'source-a', profile: 'worker' }))).toEqual({
+      connectionId: 'source-a',
+      profile: 'worker',
+      targetProfile: 'worker'
+    })
+    expect(sessionOwnerRouteFromRow(session({ profile: 'default' }))).toBeUndefined()
+    expect(sessionOwnerRouteFromRow(session({ connection_id: '  ', profile: 'default' }))).toBeUndefined()
   })
 })
 
@@ -326,6 +439,40 @@ describe('mergeSessionPage', () => {
     const incoming = [session({ connection_id: 'local', id: 'same', last_active: 1, profile: 'omar' })]
 
     expect(mergeSessionPage(previous, incoming, [])[0]).toBe(incoming[0])
+  })
+
+  it('never stitches one profile twin onto another: same id in two profiles stays two sessions (#92454)', () => {
+    // Two profiles can hold sessions with the SAME stored id (restored
+    // backups, copied state.dbs). Keyed by bare id these collapsed into one
+    // row whose title/activity carry crossed profiles — the visible seed of
+    // the cross-profile transcript/route mixups.
+    const previous = [session({ id: 'twin', last_active: 50, profile: 'testbot', title: 'Testbot work' })]
+
+    const incoming = [
+      session({ id: 'twin', last_active: 10, profile: 'quietbot' }),
+      session({ id: 'twin', last_active: 50, profile: 'testbot', title: 'Testbot work' })
+    ]
+
+    const merged = mergeSessionPage(previous, incoming, [])
+
+    // Both twins survive as distinct rows…
+    expect(merged.map(s => `${s.profile}:${s.id}`).sort()).toEqual(['quietbot:twin', 'testbot:twin'])
+    // …and testbot's title/activity is NOT stitched onto quietbot's row.
+    const quiet = merged.find(s => s.profile === 'quietbot')
+    expect(quiet?.title ?? null).toBeNull()
+    expect(quiet?.last_active).toBe(10)
+  })
+
+  it('a kept twin in another profile survives the incoming page dedupe (#92454)', () => {
+    // The incoming page carries only ONE profile's copy; the other profile's
+    // twin was in the previous list and pinned via keep. Bare-id dedupe
+    // treated the ids as equal and dropped the kept twin.
+    const previous = [session({ id: 'twin', profile: 'quietbot' })]
+    const incoming = [session({ id: 'twin', message_count: 2, profile: 'testbot' })]
+
+    const merged = mergeSessionPage(previous, incoming, ['twin'])
+
+    expect(merged.map(s => `${s.profile}:${s.id}`).sort()).toEqual(['quietbot:twin', 'testbot:twin'])
   })
 
   it('returns the server page untouched when there is nothing to keep', () => {

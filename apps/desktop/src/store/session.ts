@@ -5,7 +5,11 @@ import { lastVisibleMessageIsUser } from '@/app/chat/thread-loading'
 import type { ContextSuggestion } from '@/app/types'
 import type { HermesConnection } from '@/global'
 import type { ChatMessage } from '@/lib/chat-messages'
-import { activeConnectionScopeSuffix, rescopeConnectionScopedStores } from '@/lib/connection-scoped'
+import {
+  activeConnectionScopeSuffix,
+  connectionScopeSuffix,
+  rescopeConnectionScopedStores
+} from '@/lib/connection-scoped'
 import { persistBoolean, persistString, readJson, storedBoolean, storedString, writeJson } from '@/lib/storage'
 import { syncCronModelImpactConnection } from '@/store/cron-model-impact-scope'
 import type { SessionInfo, UsageStats } from '@/types/hermes'
@@ -21,13 +25,49 @@ const WORKSPACE_CWD_KEY = 'hermes.desktop.workspace-cwd'
 // The composer's model/effort/fast is sticky UI state, NOT the profile default
 // (that lives in Settings → Model). Persisting it in localStorage makes a pick
 // follow across Cmd+N and app restarts instead of snapping back to the default.
-// It's deliberately global (not per-profile): a profile switch force-reseeds to
-// that profile's default, while within a profile new chats keep your last pick.
+// Model/provider/source are scoped to the remote (connection, profile) owner so
+// a provider authenticated on one profile cannot contaminate another profile's
+// session.create. Local/single-backend users retain the historical bare keys.
 const COMPOSER_MODEL_KEY = 'hermes.desktop.composer.model'
 const COMPOSER_PROVIDER_KEY = 'hermes.desktop.composer.provider'
 const COMPOSER_MODEL_SOURCE_KEY = 'hermes.desktop.composer.model-source'
 const COMPOSER_EFFORT_KEY = 'hermes.desktop.composer.reasoning-effort'
 const COMPOSER_FAST_KEY = 'hermes.desktop.composer.fast'
+
+// Unlike presentation-oriented $connection, this scope is published from the
+// gateway activation coordinate before profile-change effects can reseed the
+// composer. null means the exact owner is temporarily unknown: values may still
+// paint, but must not be written through the previous backend's storage key.
+let composerSelectionScope: string | null = ''
+
+function composerScopeForConnection(connection: HermesConnection | null): string | null {
+  if (!connection) {
+    return null
+  }
+
+  // Electron may infer the sole `local` registry id onto the ordinary primary
+  // descriptor. That remains the legacy single-backend path: only an explicit
+  // registry-scoped route earns a new namespace.
+  if (connection.mode !== 'remote' && !connection.registryScoped) {
+    return ''
+  }
+
+  if (connection.connectionId) {
+    return `.registry.${encodeURIComponent(connection.connectionId)}.${encodeURIComponent(connection.profile || 'default')}`
+  }
+
+  return connectionScopeSuffix(connection)
+}
+
+function composerSelectionKey(base: string): string | null {
+  return composerSelectionScope === null ? null : `${base}${composerSelectionScope}`
+}
+
+function storedComposerString(base: string): string | null {
+  const key = composerSelectionKey(base)
+
+  return key === null ? null : storedString(key)
+}
 
 // The last chat the user had open, so a relaunch lands back on it instead of an
 // empty new-chat. Stored (not runtime) id — the route is keyed by stored id.
@@ -484,18 +524,34 @@ export function mergeSessionPage(
 ): SessionInfo[] {
   const keep = keepIds instanceof Set ? keepIds : new Set(keepIds)
 
+  // Rows are identified by (profile, id), never bare id: two profiles can
+  // hold sessions with the SAME stored id (restored backups, copied
+  // state.dbs, cross-profile imports — #92454). Keyed by bare id, the twins
+  // collapse into one sidebar row whose title/preview carry can stitch one
+  // profile's content onto the other profile's route — the user clicks a row
+  // previewing profile A and the resume dials profile B. Same-profile rows
+  // (including untagged ones, which normalize together) keep the exact
+  // carry behavior below.
+  // (Local normalize: importing @/store/profile here would be circular —
+  // same '' → 'default' rule as normalizeProfileKey.)
+  const profileKeyOf = (session: SessionInfo) => (session.profile ?? '').trim() || 'default'
+  const identity = (session: SessionInfo) => `${profileKeyOf(session)}::${session.id}`
+
+  const lineageIdentity = (session: SessionInfo) =>
+    `${profileKeyOf(session)}::${session._lineage_root_id ?? session.id}`
+
   // Carry a known title onto a row that arrives title-less, so a freshly
   // submitted session (e.g. a branch draft) holds its placeholder instead of
   // flashing its raw message preview in the gap between persist and the async
   // auto-titler. A real clear sets the local title null first, so this never
   // masks one.
-  const prevById = new Map(previous.map(session => [session.id, session]))
+  const prevById = new Map(previous.map(session => [identity(session), session]))
   // Tip rotation changes the live id — carry activity/title across the lineage
   // root so a mid-turn refresh can't drop a touchSessionActivity bump.
-  const prevByLineage = new Map(previous.map(session => [session._lineage_root_id ?? session.id, session]))
+  const prevByLineage = new Map(previous.map(session => [lineageIdentity(session), session]))
 
   const merged = incoming.map(session => {
-    const prev = prevById.get(session.id) ?? prevByLineage.get(session._lineage_root_id ?? session.id)
+    const prev = prevById.get(identity(session)) ?? prevByLineage.get(lineageIdentity(session))
     // User-send stamps last_active before the DB flushes the user row
     // (last_active = MAX(messages.timestamp)). Keep the fresher of the two.
     const last_active = Math.max(prev?.last_active ?? 0, session.last_active ?? 0)
@@ -519,18 +575,20 @@ export function mergeSessionPage(
     return merged
   }
 
-  const incomingIds = new Set(merged.map(session => session.id))
+  const incomingIds = new Set(merged.map(identity))
 
   // Deduplicate by compression lineage: when auto-compression rotates the tip
   // id (old #4 → new #5), the incoming page carries the new tip but the
   // previous list still holds the old one.  Without lineage-level dedup both
-  // rows survive as separate sidebar entries (fixes #43483).
-  const incomingLineageKeys = new Set(merged.map(session => session._lineage_root_id ?? session.id))
+  // rows survive as separate sidebar entries (fixes #43483). Lineage keys are
+  // profile-qualified for the same reason as identity above — a twin id in
+  // another profile is a DIFFERENT session and must survive the dedupe.
+  const incomingLineageKeys = new Set(merged.map(lineageIdentity))
 
   const survivors = previous.filter(
     session =>
-      !incomingIds.has(session.id) &&
-      !incomingLineageKeys.has(session._lineage_root_id ?? session.id) &&
+      !incomingIds.has(identity(session)) &&
+      !incomingLineageKeys.has(lineageIdentity(session)) &&
       (keep.has(session.id) || (session._lineage_root_id != null && keep.has(session._lineage_root_id)))
   )
 
@@ -634,6 +692,32 @@ export const $messagingPlatformTotals = atom<Record<string, number>>({})
 // True when the combined seed fetch hit MESSAGING_SECTION_LIMIT, so at least
 // one platform may have more rows on disk than were loaded.
 export const $messagingTruncated = atom<boolean>(false)
+
+/**
+ * Every session row the renderer knows, for OWNER lookups. The sidebar splits
+ * its fetch into three source-scoped slices ($sessions / $cronSessions /
+ * $messagingSessions), and each slice's rows carry the same `profile` (and,
+ * when tagged, `connection_id`) stamps — but the owner ladder's row rung only
+ * searched recents. A cron or messaging session's approval.respond (or any
+ * session-scoped RPC) therefore found no owner, and on a registry-topology
+ * install failed closed with SessionOwnerResolutionError even though the row
+ * naming its owner was already in memory, one atom over. Concatenation order
+ * mirrors lookup priority: recents first (they can carry fresher optimistic
+ * connection tags), then the cron and messaging slices.
+ */
+export function ownerLookupSessionRows(): SessionInfo[] {
+  const cron = $cronSessions.get()
+  const messaging = $messagingSessions.get()
+
+  // Recents-only stays the common case; keep its array identity (no copy) so
+  // per-list memo caches (lineageAliases) keyed on the reference still hit.
+  if (!cron.length && !messaging.length) {
+    return $sessions.get()
+  }
+
+  return [...$sessions.get(), ...cron, ...messaging]
+}
+
 // Whether a profile's last session page was CAPPED by the request limit, keyed
 // by profile name — i.e. more rows exist on disk than were loaded. Replaces the
 // old exact per-profile totals: rendering `loaded/total` in the sidebar cost a
@@ -823,6 +907,46 @@ export function forgetSessionOwnerHintsForConnection(connectionId: string): void
   }
 }
 
+/** Drop every persisted route for one session. Untagged rows are owned by the
+ * ambient backend that returned them, so a stale explicit hint must not force a
+ * later resume onto a different connection. */
+export function forgetSessionOwnerHintsForSession(sessionId: string): void {
+  const id = sessionId.trim()
+
+  if (!id) {
+    return
+  }
+
+  let changed = false
+
+  for (const [key, entry] of [...sessionOwnerHints]) {
+    if (entry.id === id) {
+      sessionOwnerHints.delete(key)
+      changed = true
+    }
+  }
+
+  if (changed) {
+    persistSessionOwnerHints()
+  }
+}
+
+/** Exact route carried by a connection-tagged row. An untagged row deliberately
+ * returns undefined: it belongs to the ambient backend that supplied the list,
+ * including the legacy primary-SSH path whose rows have no registry id. */
+export function sessionOwnerRouteFromRow(
+  session?: Pick<SessionInfo, 'connection_id' | 'profile'>
+): SessionOwnerRoute | undefined {
+  const connectionId = (session?.connection_id ?? '').trim()
+  const profile = (session?.profile ?? '').trim()
+
+  if (!connectionId || !profile) {
+    return undefined
+  }
+
+  return { connectionId, profile, targetProfile: profile }
+}
+
 /** @internal Tests: forget every in-memory hint (storage untouched unless asked). */
 export function _resetSessionOwnerHintsForTests({ storage = false }: { storage?: boolean } = {}): void {
   sessionOwnerHints.clear()
@@ -864,8 +988,8 @@ export function getSessionOwnerHint(
 // clears it and resets the retry counter. Null whenever the active route has a
 // healthy, in-flight, or still-auto-retrying resume.
 export const $resumeExhaustedSessionId = atom<string | null>(null)
-export const $currentModel = atom(storedString(COMPOSER_MODEL_KEY) ?? '')
-export const $currentProvider = atom(storedString(COMPOSER_PROVIDER_KEY) ?? '')
+export const $currentModel = atom(storedComposerString(COMPOSER_MODEL_KEY) ?? '')
+export const $currentProvider = atom(storedComposerString(COMPOSER_PROVIDER_KEY) ?? '')
 export const $currentReasoningEffort = atom(storedString(COMPOSER_EFFORT_KEY) ?? '')
 export const $currentServiceTier = atom('')
 export const $currentFastMode = atom(storedBoolean(COMPOSER_FAST_KEY, false))
@@ -921,6 +1045,31 @@ export const $contextSuggestions = atom<ContextSuggestion[]>([])
 export const $modelPickerOpen = atom(false)
 export const $sessionPickerOpen = atom(false)
 
+function rescopeComposerSelection(nextScope: string | null): void {
+  if (nextScope === composerSelectionScope) {
+    return
+  }
+
+  composerSelectionScope = nextScope
+  $currentModel.set(storedComposerString(COMPOSER_MODEL_KEY) ?? '')
+  $currentProvider.set(storedComposerString(COMPOSER_PROVIDER_KEY) ?? '')
+  $currentModelSource.set(getCurrentModelSource())
+}
+
+/** Publish an exact registry route before active-profile effects can persist a
+ * forced default. A registry id is authority even while its descriptive
+ * HermesConnection lookup is unavailable. */
+export function setComposerSelectionOwner(connectionId: string, profile: string): void {
+  rescopeComposerSelection(
+    `.registry.${encodeURIComponent(connectionId)}.${encodeURIComponent(profile.trim() || 'default')}`
+  )
+}
+
+/** Fail closed while a successful legacy profile activation has no descriptor. */
+export function clearComposerSelectionOwner(): void {
+  rescopeComposerSelection(null)
+}
+
 export const setConnection = (next: Updater<HermesConnection | null>) => {
   updateAtom($connection, next)
   // Repoint connection-scoped persistence (pins, manual session order,
@@ -929,6 +1078,7 @@ export const setConnection = (next: Updater<HermesConnection | null>) => {
   // keeps the current scope.
   rescopeConnectionScopedStores($connection.get())
   syncCronModelImpactConnection($connection.get())
+  rescopeComposerSelection(composerScopeForConnection($connection.get()))
 }
 
 export const setGatewayState = (next: Updater<ConnectionState>) => updateAtom($gatewayState, next)
@@ -1053,16 +1203,24 @@ export const setAwaitingResponse = (next: Updater<boolean>) => updateAtom($await
 
 export const setCurrentModel = (next: Updater<string>) => {
   updateAtom($currentModel, next)
-  persistString(COMPOSER_MODEL_KEY, $currentModel.get() || null)
+  const key = composerSelectionKey(COMPOSER_MODEL_KEY)
+
+  if (key !== null) {
+    persistString(key, $currentModel.get() || null)
+  }
 }
 
 export const setCurrentProvider = (next: Updater<string>) => {
   updateAtom($currentProvider, next)
-  persistString(COMPOSER_PROVIDER_KEY, $currentProvider.get() || null)
+  const key = composerSelectionKey(COMPOSER_PROVIDER_KEY)
+
+  if (key !== null) {
+    persistString(key, $currentProvider.get() || null)
+  }
 }
 
 export const getCurrentModelSource = (): ComposerModelSource => {
-  const source = storedString(COMPOSER_MODEL_SOURCE_KEY)
+  const source = storedComposerString(COMPOSER_MODEL_SOURCE_KEY)
 
   return source === 'default' || source === 'manual' ? source : ''
 }
@@ -1073,7 +1231,12 @@ export const getCurrentModelSource = (): ComposerModelSource => {
 export const $currentModelSource = atom<ComposerModelSource>(getCurrentModelSource())
 
 export const setCurrentModelSource = (source: ComposerModelSource) => {
-  persistString(COMPOSER_MODEL_SOURCE_KEY, source || null)
+  const key = composerSelectionKey(COMPOSER_MODEL_SOURCE_KEY)
+
+  if (key !== null) {
+    persistString(key, source || null)
+  }
+
   $currentModelSource.set(source)
 }
 
