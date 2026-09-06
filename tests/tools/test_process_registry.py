@@ -1956,13 +1956,10 @@ class TestSystemdCgroupIsolation:
             if value == "--property"
         ]
         assert "MemoryAccounting=yes" in properties
-        # OOMPolicy= requires systemd >=254; the argv gate drops it on older
-        # managers (Ubuntu 22.04 = 249) so the probe stays honest there.
-        import tools.process_registry as _pr
-        if _pr._systemd_supports_oom_policy():
-            assert "OOMPolicy=kill" in properties
-        else:
-            assert "OOMPolicy=kill" not in properties
+        # OOMPolicy= is a service-unit property — transient scopes reject it
+        # outright ("Unknown assignment"), which fail-closed every restart-safe
+        # cron dispatch (#102357/#102486). It must stay absent from the argv.
+        assert "OOMPolicy=kill" not in properties
         memory_max = next(
             value for value in properties if value.startswith("MemoryMax=")
         )

@@ -10,7 +10,6 @@ import json
 import logging
 import os
 import platform
-import re
 import shlex
 import signal
 import subprocess
@@ -128,38 +127,17 @@ def _worker_memory_max_bytes() -> int:
 def _systemd_scope_argv(binary: str, unit_name: str, *argv: str) -> List[str]:
     """``systemd-run --user --scope`` argv shared by the probe and real spawns.
     ``--collect`` self-cleans the scope after exit; ``--unit`` names it for systemctl.
-    ``OOMPolicy=`` requires systemd ≥254 — on older managers (e.g. 249, Ubuntu 22.04)
-    the whole invocation fails with "Unknown assignment", so the property is only sent
-    when the running systemd supports it (probe stays honest on old systemd)."""
-    props = ["--property", "MemoryAccounting=yes",
-             "--property", f"MemoryMax={_worker_memory_max_bytes()}"]
-    if _systemd_supports_oom_policy():
-        props += ["--property", "OOMPolicy=kill"]
+    OOMPolicy= is a SERVICE-unit property — transient scopes reject it with
+    "Unknown assignment" (no service manager acts on the OOM event inside a scope),
+    which fail-closed every restart-safe cron dispatch (#102357, #102486). Dropped;
+    MemoryAccounting/MemoryMax containment retained. Matches the upstream fix under
+    review — remove this comment block once it merges and the tree is stock again."""
     return [
         binary, "--user", "--scope", "--quiet", "--unit", unit_name, "--collect",
-        *props,
+        "--property", "MemoryAccounting=yes",
+        "--property", f"MemoryMax={_worker_memory_max_bytes()}",
         "--", *argv,
     ]
-
-
-_SYSTEMD_VERSION: Optional[int] = None
-
-
-def _systemd_supports_oom_policy() -> bool:
-    """True when the running systemd manager supports the OOMPolicy= unit property
-    (added in systemd v254). Cached for the process lifetime; falls open (True) when
-    the version cannot be determined — a probe failure then surfaces the real error."""
-    global _SYSTEMD_VERSION
-    if _SYSTEMD_VERSION is None:
-        try:
-            out = subprocess.run(
-                ["systemctl", "--version"], capture_output=True, timeout=5, text=True,
-            ).stdout
-            m = re.search(r"systemd (\d+)", out)
-            _SYSTEMD_VERSION = int(m.group(1)) if m else 0
-        except Exception:
-            _SYSTEMD_VERSION = 0
-    return _SYSTEMD_VERSION >= 254
 
 
 def _systemd_scope_cached() -> Optional[bool]:
