@@ -1178,3 +1178,39 @@ class TestValueAwareGatingCorpus:
         result = redact_sensitive_text(block, force=True)
         assert prose_line in result
         assert "A9f3kZq7Lm2Xw8Rt4Yv6" not in result
+
+
+class TestWireGuardKeyRedaction:
+    """Raw 32-byte WG keys have no vendor prefix and are invisible to every
+    other pass (Dark Island incident 2026-09-09: `cat wg0.conf` leaked the
+    PrivateKey verbatim). The _WG_KEY_RE pass is unconditional — every mode."""
+
+    REAL_KEY = "ULcLL5c4adMoWhHiWzq8IyiMK6lsdWHRcCqqJe88SG4="  # real wg genkey shape (burned 09-09, revoked)
+
+    def test_wg_private_key_masked_in_every_mode(self):
+        line = f"PrivateKey = {self.REAL_KEY}"
+        for kwargs in ({}, {"code_file": True}, {"file_read": True}, {"force": True}):
+            result = redact_sensitive_text(line, **kwargs)
+            assert self.REAL_KEY not in result, kwargs
+            assert "[REDACTED-WG-KEY]" in result, kwargs
+
+    def test_wg_preshared_key_masked(self):
+        line = f"PresharedKey = {self.REAL_KEY}"
+        assert self.REAL_KEY not in redact_sensitive_text(line, code_file=True)
+
+    def test_wg_public_key_not_mangled(self):
+        line = "PublicKey = qcvI02LwBnTb7aFrOyZSWvg4kb7zNW9/+rS6alnWyFE="
+        assert redact_sensitive_text(line, force=True) == line
+
+    def test_prose_private_key_untouched(self):
+        line = "the private key file is missing"
+        assert redact_sensitive_text(line, force=True) == line
+
+    def test_full_wg_conf_block(self):
+        block = (f"[Interface]\n# Device: Warm Possum\nPrivateKey = {self.REAL_KEY}\n"
+                 "Address = 10.71.250.243/32\n[Peer]\nPublicKey = qcvI02LwBnTb7aFrOyZSWvg4kb7zNW9/+rS6alnWyFE=\n"
+                 "Endpoint = 193.32.127.67:51820")
+        result = redact_sensitive_text(block, code_file=True)
+        assert self.REAL_KEY not in result
+        assert "qcvI02Lw" in result  # server public key survives (public info)
+        assert "193.32.127.67:51820" in result  # Endpoint survives
