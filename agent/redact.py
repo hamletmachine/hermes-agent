@@ -288,6 +288,19 @@ _TELEGRAM_RE = re.compile(r"(bot)?(\d{8,}):([-A-Za-z0-9_]{30,})")
 
 _PRIVATE_KEY_RE = re.compile(r"-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----")
 
+# WireGuard config key material (``PrivateKey = <base64>``, ``PresharedKey =``):
+# raw 32-byte Curve25519 keys carry NO vendor prefix, so the prefix pass never
+# matches them, and bare ``key`` is deliberately excluded from _SECRET_CFG_NAMES
+# — meaning ``cat wg0.conf`` leaked the key verbatim even with redaction on
+# (Dark Island incident 2026-09-09, twice in one session). PEM blocks get their
+# own unconditional pass for exactly this reason; WG keys get the same treatment:
+# exact-case config keyword + strict key shape (32 bytes -> 44 base64 chars with
+# a single ``=`` pad) runs in EVERY mode, including code_file/file_read where
+# the assignment passes are skipped. The keyword is case-sensitive (``PrivateKey``
+# is the config literal) so prose ``private key`` never matches; the value shape
+# makes false positives on identifiers/prose vanishingly rare.
+_WG_KEY_RE = re.compile(r"(PrivateKey|PresharedKey)(\s*=\s*)([A-Za-z0-9+/]{43}=|[A-Za-z0-9+/]{42}={2})")
+
 # Database connection strings: protocol://user:PASSWORD@host. The userinfo and
 # password groups forbid whitespace so a match can never span a line break (a
 # greedy ``[^@]+`` once ran to a decorator's ``@`` on the next code line).
@@ -609,6 +622,12 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
 
     if "BEGIN" in text and "-----" in text:
         text = _PRIVATE_KEY_RE.sub("[REDACTED PRIVATE KEY]", text)
+
+    # WireGuard key material: unconditional (every mode, incl. code_file and
+    # file_read) — same policy as the PEM pass above. Raw 32-byte WG keys have
+    # no vendor prefix and are otherwise invisible to every other pass.
+    if "Key" in text:
+        text = _WG_KEY_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}[REDACTED-WG-KEY]", text)
 
     # Database connection string passwords. With code_file=True, a password group that is a pure ``{...}``
     # brace expression is an f-string template reference (e.g. f"postgresql://{user}:{pass}@{host}"), not a
