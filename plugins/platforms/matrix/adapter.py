@@ -1574,17 +1574,18 @@ class MatrixAdapter(BasePlatformAdapter):
             async with _aiohttp.ClientSession(**_sess_kw) as http:
                 fetch_url = url
                 for _ in range(20):
-                    # DARK ISLAND PATCH: asyncio.wait_for instead of aiohttp's
-                    # per-request ClientTimeout CM (same no-running-Task hazard as
-                    # _create_matrix_session; media fetch runs in adapter context).
-                    async def _fetch_hop():
-                        return await http.get(
-                            fetch_url, timeout=None, allow_redirects=False, **_req_kw)
-                    try:
-                        resp = await asyncio.wait_for(_fetch_hop(), timeout=30)
-                    except asyncio.TimeoutError:
-                        raise
-                    async with resp:
+                    # DARK ISLAND PATCH (carried): upstream's per-request
+                    # ClientTimeout + async-with is KEPT here. The no-running-Task
+                    # timeout-CM hazard (cron standalone sends, see
+                    # _create_matrix_session / _standalone_send) is unreachable on
+                    # this path — sole caller is adapter send_image, always inside a
+                    # gateway task; _standalone_send is text-only. The wait_for
+                    # variant previously carried here awaited http.get() directly,
+                    # breaking the async-CM contract upstream's
+                    # test_external_media_download_follows_safe_redirect pins.
+                    async with http.get(
+                        fetch_url, timeout=_aiohttp.ClientTimeout(total=30),
+                        allow_redirects=False, **_req_kw) as resp:
                         if resp.status in {301, 302, 303, 307, 308}:
                             location = resp.headers.get("Location")
                             if not location:
