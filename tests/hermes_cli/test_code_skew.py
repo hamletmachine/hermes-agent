@@ -72,6 +72,38 @@ class TestModelSwitchSkewGuard:
         assert "hermes gateway restart" in msg
 
 
+class TestSkewPolicy:
+    """``gateway.code_skew_policy``: enforce (default, upstream) vs warn (hot-commit hatch)."""
+
+    def test_policy_defaults_to_enforce_without_config(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("gateway.run._gateway_config_home", lambda: tmp_path)
+        assert code_skew.skew_policy() == "enforce"
+
+    def test_policy_reads_warn_from_gateway_config(self, monkeypatch, tmp_path):
+        (tmp_path / "config.yaml").write_text("gateway:\n  code_skew_policy: warn\n")
+        monkeypatch.setattr("gateway.run._gateway_config_home", lambda: tmp_path)
+        assert code_skew.skew_policy() == "warn"
+
+    def test_unknown_policy_falls_back_to_enforce(self, monkeypatch, tmp_path):
+        (tmp_path / "config.yaml").write_text("gateway:\n  code_skew_policy: off\n")
+        monkeypatch.setattr("gateway.run._gateway_config_home", lambda: tmp_path)
+        assert code_skew.skew_policy() == "enforce"
+
+    def test_warn_policy_lets_model_switch_proceed(self, monkeypatch):
+        from gateway import slash_commands_model as slash_commands
+
+        monkeypatch.setattr(code_skew, "detect_code_skew", lambda: ("abc1234567", "def4567890"))
+        monkeypatch.setattr(code_skew, "skew_policy", lambda: "warn")
+        assert slash_commands._model_switch_skew_guard() is None
+
+    def test_warn_policy_lets_dashboard_picker_proceed(self, monkeypatch):
+        from hermes_cli import web_server_config as web_cfg
+
+        monkeypatch.setattr(code_skew, "detect_code_skew", lambda: ("abc1234567", "def4567890"))
+        monkeypatch.setattr(code_skew, "skew_policy", lambda: "warn")
+        assert web_cfg._dashboard_code_skew_guard() is None
+
+
 class TestDashboardCodeSkewGuard:
     """Dashboard mirror of the gateway's model-switch skew guard (#86207)."""
 

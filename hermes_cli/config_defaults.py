@@ -1986,6 +1986,10 @@ DEFAULT_CONFIG = {
         # served together — the duplicate adapter is parked; `hermes profile create --clone`
         # therefore leaves messaging channels behind unless --clone-channels is passed.
         "multiplex_profiles": False,
+        # Refusal policy for the code-skew guards (/model, dashboard model picker) when the
+        # checkout moved after boot. "enforce" = upstream default (refuse, advise restart);
+        # "warn" = hot-commit fleets proceed and log. Read via gateway.code_skew.skew_policy.
+        "code_skew_policy": "enforce",
         # May `hermes update` fold this install onto a multiplexed default gateway by itself?
         # True (the default) keeps today's behaviour: a multi-profile install whose secondaries run
         # their own gateways is migrated automatically after an update when nothing blocks it.

@@ -37,13 +37,22 @@ _REASONING_DISPLAY_TOGGLES = {"show": True, "on": True, "hide": False, "off": Fa
 
 def _model_switch_skew_guard() -> Optional[str]:
     """Refuse a model switch when the gateway is running stale code: a first-time lazy import on
-    a new code path can crash on a stale cached dependency. Scoped to the highest-risk trigger."""
-    from gateway.code_skew import detect_code_skew
+    a new code path can crash on a stale cached dependency. Scoped to the highest-risk trigger.
+
+    Dark-island carry: ``gateway.code_skew_policy: warn`` downgrades the refusal to a log line
+    so /model proceeds on hot-commit fleets; the upstream default ``enforce`` is unchanged."""
+    from gateway.code_skew import detect_code_skew, skew_policy
 
     skew = detect_code_skew()
     if not skew:
         return None
     boot_rev, disk_rev = skew
+    if skew_policy() == "warn":
+        logger.warning(
+            "code skew (boot=%s disk=%s): policy=warn — /model proceeding",
+            boot_rev, disk_rev,
+        )
+        return None
     return t(
         "gateway.model.error_prefix",
         error=(

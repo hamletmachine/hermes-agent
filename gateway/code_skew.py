@@ -46,3 +46,21 @@ def detect_code_skew() -> tuple[str, str] | None:
     if current is None or current == _boot_fingerprint:
         return None
     return _short(_boot_fingerprint), _short(current)
+
+
+def skew_policy() -> str:
+    """``gateway.code_skew_policy`` — ``enforce`` (default) or ``warn``.
+
+    ``warn`` is the escape hatch for hot-commit deployments (agents committing to the
+    live checkout between gateway restarts): risky callers proceed and log the skew
+    instead of refusing. Read through the gateway's effective-config loader so profile
+    scope resolves correctly; any failure falls back to ``enforce`` (upstream behavior).
+    """
+    try:
+        from gateway.run import _load_gateway_config
+
+        cfg = _load_gateway_config()
+        policy = (cfg.get("gateway") or {}).get("code_skew_policy")
+        return policy if policy in ("enforce", "warn") else "enforce"
+    except Exception:
+        return "enforce"

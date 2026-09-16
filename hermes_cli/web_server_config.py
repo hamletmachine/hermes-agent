@@ -526,12 +526,18 @@ def _dashboard_code_skew_guard() -> Optional[str]:
     ``/api/model/options`` 500 after the update added ``agent.model_metadata.is_grok_46_family`` while the
     running process kept serving the pre-update module (#86207).
     """
-    from gateway.code_skew import detect_code_skew
+    from gateway.code_skew import detect_code_skew, skew_policy
 
     skew = detect_code_skew()
     if not skew:
         return None
     boot_rev, disk_rev = skew
+    if skew_policy() == "warn":
+        _log.warning(
+            "code skew (boot=%s disk=%s): policy=warn — dashboard model picker proceeding",
+            boot_rev, disk_rev,
+        )
+        return None
     return (
         f"This process is running code from {boot_rev} but the checkout on "
         f"disk is now {disk_rev}. The model picker would risk a stale-module "
