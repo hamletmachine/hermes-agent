@@ -19,6 +19,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from hermes_cli._subprocess_compat import windows_hide_flags
+from hermes_platform.host.runtime import is_wsl
 from tools.computer_use.backend import ActionResult, ComputerUseBackend
 from tools.computer_use.cua_backend_capture import _CaptureMixin
 from tools.computer_use.cua_backend_daemon import _EmbeddedCuaDaemon
@@ -53,9 +54,7 @@ def _cua_no_overlay() -> bool:
     val = _computer_use_cfg().get("no_overlay")
     if val is not None or sys.platform != "linux":
         return bool(val) if val is not None else sys.platform == "darwin"
-    wsl = False
-    with contextlib.suppress(Exception), open("/proc/version", encoding="utf-8") as f:
-        wsl = "microsoft" in f.read().lower()
+    wsl = is_wsl()
     return wsl or not os.environ.get("DISPLAY") or (
         # Linux/X11: the cursor overlay is a fullscreen, always-on-top, all-workspaces X11 window
         # (save-unders path). An unclean session end (agent interrupted mid-capture, stale target window)
