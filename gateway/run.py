@@ -1744,11 +1744,18 @@ def _handoff_watch_scopes(runner: object) -> list:
     """``(profile_name, home)`` pairs whose ``state.db`` the watcher must poll; ``(None, None)`` = root
     poll, always first. ``/handoff`` writes into the store of the profile the CLI ran under; an unscoped
     watcher polls only the ROOT store, so a secondary profile's handoff would never be seen (CLI times
-    out). A raising resolver degrades to the root poll rather than silently disabling the watcher."""
+    out). A raising resolver degrades to the root poll rather than silently disabling the watcher.
+
+    Dark-island 2026-09-24: satellite profiles are enumerated regardless of the multiplex flag.
+    Under a STANDALONE default gateway (multiplex off — our shared-credential + room-router
+    topology), satellites were previously absent here, so the restart-safe delivery drain AND the
+    queue watch never saw satellite ``deliveries.db`` files and script jobs' queued sends sat
+    pending forever (09-24 fleet incident). The drain authorizes satellite sends through
+    ``gateway.profile_routes`` (SharedRouteAdapters, fail closed)."""
     scopes: list = [(None, None)]
     try:
         config = getattr(runner, "config", None)
-        if config is not None and getattr(config, "multiplex_profiles", False):
+        if config is not None:
             for name, home in _multiplex_profile_homes(config):
                 if home is None or not name or name == "default":
                     continue
@@ -1756,6 +1763,32 @@ def _handoff_watch_scopes(runner: object) -> list:
     except Exception:
         logger.debug("Could not resolve multiplex homes for handoff watcher", exc_info=True)
     return scopes
+
+
+def _primary_routes_for_profile(profile_name: str) -> list:
+    """Primary-config ``profile_routes`` entries authorizing sends to *profile_name* (enabled,
+    exact match). Empty when the primary config declares none — callers fail closed. Reads the
+    raw primary config so no current-profile merged config leaks in (mirrors
+    ``scheduler_preflight._primary_profile_routes_for_current_home``). Dark-island 2026-09-24."""
+    try:
+        from hermes_constants import get_default_hermes_root
+        from hermes_cli.config import read_user_config_raw
+        from gateway.profile_routing import parse_profile_routes
+
+        config_path = get_default_hermes_root() / "config.yaml"
+        if not config_path.exists():
+            return []
+        raw = read_user_config_raw(config_path) or {}
+        routes_raw = raw.get("profile_routes")
+        if routes_raw is None and isinstance(raw.get("gateway"), dict):
+            routes_raw = raw["gateway"].get("profile_routes")
+        if not isinstance(routes_raw, list):
+            return []
+        return [r for r in parse_profile_routes(routes_raw)
+                if r.enabled and str(r.profile) == str(profile_name)]
+    except Exception:
+        logger.debug("profile-route lookup failed for %r", profile_name, exc_info=True)
+        return []
 
 
 async def _reclaim_stale(runner: object) -> None:
@@ -4772,7 +4805,16 @@ def _drain_restart_safe_cron_deliveries(adapters, loop, runner=None) -> None:
         else:
             profile_adapters = getattr(runner, "_profile_adapters", {}).get(profile_name)
         if profile_adapters is None:
-            continue
+            # Dark-island 2026-09-24: standalone default gateway — satellites have NO entry in
+            # the adapter map (previously: skipped, queues starved). Authorize the satellite's
+            # sends through the primary's live adapters gated by its profile_routes; with no
+            # route for this profile, fail closed (skip) exactly as the upstream loop did.
+            if adapters:
+                routes = _primary_routes_for_profile(profile_name)
+                if routes:
+                    profile_adapters = sched_preflight.SharedRouteAdapters(adapters, routes)
+            if profile_adapters is None:
+                continue
         with _profile_runtime_scope(profile_home or get_hermes_home()):
             if profile_name is not None and not profile_adapters and adapters:
                 routes = sched_preflight._primary_profile_routes_for_current_home()
