@@ -225,11 +225,21 @@ class MemoryStore:
             _error(message, current_entries=self._entries_for(target), usage=self._usage(target)))
 
     def _batch_failure(self, target: str, message: str) -> Dict[str, Any]:
-        """Batch-abort failure WITHOUT ``current_entries``: the store did not change and the
-        caller already holds the inventory, so echoing it made each consolidation retry
-        grow the context it was invoked to shrink (#97316)."""
+        """Batch-abort failure. Carries a COMPACT entry-heads inventory: the model's
+        system-prompt snapshot is STALE at match time (entries drift between sessions),
+        so old_text composed from it fails and the model burns its consolidation
+        budget re-guessing (#observed live 2026-10-01: 4 consecutive batch failures
+        on this deployment, every old_text sourced from the stale snapshot; the same
+        batch succeeded first-try once the model read the file). Heads (not full
+        entries) keep the retry context small — preserves the #97316 anti-bloat
+        goal while restoring matchability."""
+        entries = self._entries_for(target)
+        heads = [e[:100] + ("…" if len(e) > 100 else "") for e in entries]
         return self._consolidation_failure(
-            _error(message + " No operations were applied (batch is all-or-nothing).", usage=self._usage(target)))
+            _error(message + " No operations were applied (batch is all-or-nothing). "
+                   "entry_heads below are DISK TRUTH — copy old_text from these, "
+                   "never from the system-prompt snapshot:",
+                   entry_heads=heads, usage=self._usage(target)))
 
     def _mutate(self, target: str, mutate, *, skip_drift: bool = False) -> Dict[str, Any]:
         """Lock, re-read from disk, run ``mutate(entries, limit)`` -> ``(new_entries, message)``
