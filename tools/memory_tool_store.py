@@ -219,6 +219,28 @@ class MemoryStore:
         limit = self._char_limit(target)
         return f"{min(100, int((current / limit) * 100)) if limit > 0 else 0}% — {current:,}/{limit:,} chars"
 
+    def _budget_brief(self, target: str, entries: Optional[List[str]] = None,
+                      new_total: Optional[int] = None) -> str:
+        """Compact arithmetic block for over-limit failures so the model can compute a
+        one-shot consolidation instead of guessing (#observed live 2026-10-09: three
+        consecutive batches rejected while the agent re-derived the join overhead by
+        trial and error; every number needed was already in scope at the failure site).
+        Rides ONLY on failures — zero bytes on success paths or the system prompt."""
+        if entries is None:
+            entries = self._entries_for(target)
+        limit = self._char_limit(target)
+        lines = [
+            f"Budget arithmetic: limit={limit}; tool counts len('\\n§\\n'.join(entries)) "
+            f"= sum(entry lengths) + 3*(entry_count-1); current total="
+            f"{self._char_count(target):,} across {len(entries)} entries.",
+            f"entry lengths: {[len(e) for e in entries]!r}",
+        ]
+        if new_total is not None:
+            lines.append(f"the rejected batch would land at {new_total:,} — cut at least "
+                         f"{new_total - limit:,} chars from that batch's NET effect (adds minus removals), "
+                         f"in THIS same batch.")
+        return "\n".join(lines)
+
     def _failure_with_entries(self, target: str, message: str) -> Dict[str, Any]:
         """Consolidation failure carrying the live entries so the model can consolidate."""
         return self._consolidation_failure(
@@ -286,7 +308,8 @@ class MemoryStore:
                     f"Memory at {self._char_count(target):,}/{limit:,} chars. Adding this entry "
                     f"({len(content)} chars) would exceed the limit. Consolidate now: use 'replace' to merge "
                     f"overlapping entries into shorter ones or 'remove' stale or less important entries (see "
-                    f"current_entries below), then retry this add — all in this turn."))
+                    f"current_entries below), then retry this add — all in this turn.\n"
+                    + self._budget_brief(target, entries)))
             return entries + [content], "Entry added."
         # Append-only: skip the drift guard (appending never clobbers foreign
         # content) but still refuse a failed read — add rewrites the WHOLE file.
@@ -330,7 +353,8 @@ class MemoryStore:
                 return self._failure_with_entries(target, (
                     f"Replacement would put memory at {new_total:,}/{limit:,} chars. Shorten the new content, "
                     f"or 'remove' other stale or less important entries to make room (see current_entries "
-                    f"below), then retry — all in this turn."))
+                    f"below), then retry — all in this turn.\n"
+                    + self._budget_brief(target, entries, new_total)))
             return replaced, "Entry replaced.", {"replaced_entry": entries[idx]}
         return self._mutate(target, _apply)
 
@@ -405,7 +429,8 @@ class MemoryStore:
                 return self._batch_failure(target, (
                     f"After applying all {len(operations)} operations, memory would be at "
                     f"{new_total:,}/{limit:,} chars -- over the limit. Remove or shorten more "
-                    f"entries in the same batch, then retry."))
+                    f"entries in the same batch, then retry.\n"
+                    + self._budget_brief(target, self._entries_for(target), new_total)))
             replaced_fields = {"replaced_entries": replaced} if replaced else {}
             return working, f"Applied {len(operations)} operation(s).", replaced_fields
         return self._mutate(target, _apply)

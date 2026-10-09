@@ -328,9 +328,12 @@ class TestMemoryConsolidationGracefulDegrade:
         assert "current_entries" not in r
 
     def test_apply_batch_abort_does_not_echo_store(self, store):
-        """A failed consolidation must not pay the whole MEMORY.md back (#97316)."""
-        store.add("memory", "fact A that is unique and long enough to matter")
-        store.add("memory", "fact B stays in the store after the abort")
+        """A failed consolidation must not pay the whole MEMORY.md back (#97316).
+        e8ec27a517 amended this: aborts DO carry 100-char entry heads (disk-truth
+        anchors for old_text) — the anti-bloat line is that FULL entries never ride
+        the abort, only truncated heads."""
+        store.add("memory", "fact A that is unique and long enough to matter " + "x" * 120)
+        store.add("memory", "fact B stays in the store after the abort " + "y" * 120)
         result = store.apply_batch(
             "memory",
             [{"action": "remove", "old_text": "this substring is not in any entry"}],
@@ -338,12 +341,16 @@ class TestMemoryConsolidationGracefulDegrade:
         assert result["success"] is False
         assert "current_entries" not in result
         payload = json.dumps(result)
-        assert "fact A that is unique" not in payload
-        assert "fact B stays in the store" not in payload
+        # Truncated heads are allowed (matchability anchors)…
+        assert "entry_heads" in result
+        assert all(len(h) <= 101 for h in result["entry_heads"])
+        # …but a full entry never leaks through the abort.
+        assert "fact A that is unique and long enough to matter " + "x" * 120 not in payload
+        assert "fact B stays in the store after the abort " + "y" * 120 not in payload
         assert "No operations were applied" in result["error"]
         assert store.memory_entries == [
-            "fact A that is unique and long enough to matter",
-            "fact B stays in the store after the abort",
+            "fact A that is unique and long enough to matter " + "x" * 120,
+            "fact B stays in the store after the abort " + "y" * 120,
         ]
 
     def test_success_and_turn_boundary_reset_failure_budget(self, store):
@@ -993,3 +1000,66 @@ class TestBackgroundReviewDeleteGate:
             reset_current_write_origin(token)
         assert result["success"] is True
         assert "rewritten by refine" in store._entries_for("memory")
+
+
+# =========================================================================
+# Over-limit failures carry the budget arithmetic (#observed live 2026-10-09)
+# =========================================================================
+
+class TestOverLimitErrorsCarryBudgetArithmetic:
+    """Every over-limit failure must give the model the numbers it needs for a
+    ONE-SHOT consolidation: per-entry lengths, the join-overhead rule, and the
+    batch's own shortfall. Live 2026-10-09: three consecutive rejected batches
+    while the agent re-derived the overhead by trial and error. Diagnostics ride
+    ONLY on failures — success paths stay byte-identical (#97316 anti-bloat)."""
+
+    def test_add_over_limit_error_includes_entry_lengths_and_join_rule(self, store):
+        store.add("memory", "A" * 300)
+        store.add("memory", "B" * 150)
+        result = store.add("memory", "C" * 200)
+        assert result["success"] is False
+        assert "Budget arithmetic" in result["error"]
+        assert "entry lengths: [300, 150]" in result["error"]
+        assert "3*(entry_count-1)" in result["error"]
+        assert result["usage"]  # usage line still present
+
+    def test_replace_over_limit_error_includes_shortfall(self, store):
+        store.add("memory", "A" * 300)
+        store.add("memory", "B" * 150)
+        result = store.replace("memory", "AAAA", "R" * 500)
+        assert result["success"] is False
+        assert "Budget arithmetic" in result["error"]
+        assert "would land at" in result["error"]
+        assert "cut at least" in result["error"]
+
+    def test_batch_over_limit_error_includes_shortfall_and_heads(self, store):
+        store.add("memory", "A" * 300)
+        result = store.apply_batch("memory", [
+            {"action": "remove", "old_text": "AAA"},
+            {"action": "add", "content": "Z" * 600},
+        ])
+        assert result["success"] is False
+        assert "Budget arithmetic" in result["error"]
+        assert "would land at" in result["error"]
+        assert "entry_heads" in result  # heads inventory preserved
+
+    def test_success_paths_carry_no_arithmetic(self, store):
+        store.add("memory", "A" * 100)
+        ok_add = store.add("memory", "B" * 100)
+        assert ok_add["success"] is True
+        assert "Budget arithmetic" not in str(ok_add)
+        ok_batch = store.apply_batch("memory", [
+            {"action": "remove", "old_text": "AAA"},
+            {"action": "add", "content": "C" * 100},
+        ])
+        assert ok_batch["success"] is True
+        assert "Budget arithmetic" not in str(ok_batch)
+
+    def test_brief_matches_actual_counting_rule(self, store):
+        store.add("memory", "A" * 300)
+        store.add("memory", "B" * 150)
+        entries = store._entries_for("memory")
+        brief = store._budget_brief("memory", entries)
+        from tools.memory_tool_store import ENTRY_DELIMITER
+        assert f"current total={len(ENTRY_DELIMITER.join(entries)):,}" in brief
+        assert repr([len(e) for e in entries]) in brief
