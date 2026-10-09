@@ -1984,9 +1984,14 @@ class ProcessRegistry(ProcessCheckpointMixin):
         ``timeout`` defaults to (and is clamped by) TERMINAL_TIMEOUT. Returns a dict
         with status exited|timeout|interrupted|not_found|error and an output snapshot."""
         from tools.interrupt import consume_yield as _consume_yield, is_interrupted as _is_interrupted
+        # Scope-aware read (same contract as terminal_tool's _tenv): under gateway
+        # multiplexing the routed profile's TERMINAL_* policy arrives via the per-turn
+        # terminal scope, deliberately NOT os.environ (#68559) — a raw os.getenv here was
+        # the one blind consumer, so profile .env TERMINAL_TIMEOUT never clamped waits.
+        from tools.terminal_scope import terminal_env as _terminal_env
 
         try:
-            max_timeout = int(os.getenv("TERMINAL_TIMEOUT", "180"))
+            max_timeout = int(_terminal_env("TERMINAL_TIMEOUT", "180"))
         except (ValueError, TypeError):
             max_timeout = 180
         # The schema says minimum=1 but not every caller enforces it; timeout=0 is
