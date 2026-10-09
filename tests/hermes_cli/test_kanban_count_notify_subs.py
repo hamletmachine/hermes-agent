@@ -131,3 +131,52 @@ def test_count_notify_subs_filters_profile_owners(tmp_path):
         notifier_profiles={"default"},
         include_unowned=True,
     ) == 2
+
+
+# --- standalone lock-holder wildcard (red's 10-09 fix) ---
+
+def test_wildcard_filter_matches_every_stamped_profile(kanban_home):
+    """_notify_profile_filter('*'-only) = no profile predicate: a standalone
+    lock-holder gateway must see rows stamped with foreign profiles (session
+    auto-subscribe stamps the CREATOR profile), not just its own active one."""
+    conn = kbc.connect(board="default")
+    try:
+        tid = kb.create_task(conn, title="w", assignee="worker")
+        kbn.add_notify_sub(
+            conn, task_id=tid, platform="matrix", chat_id="!x:matrix.org",
+            notifier_profile="red",
+        )
+        kbn.add_notify_sub(
+            conn, task_id=tid, platform="matrix", chat_id="!y:matrix.org",
+            notifier_profile="default",
+        )
+    finally:
+        conn.close()
+    assert kbn.count_notify_subs(board="default", notifier_profiles=["*"]) == 2
+    conn = kbc.connect(board="default")
+    try:
+        assert len(kbn.list_notify_subs(conn, notifier_profiles=["*"])) == 2
+    finally:
+        conn.close()
+    # strict filter unchanged for non-wildcard callers:
+    assert kbn.count_notify_subs(board="default", notifier_profiles=["red"]) == 1
+
+
+def test_wildcard_only_when_it_is_the_sole_marker(kanban_home):
+    """A real profile literally named '*' must not silently widen the filter,
+    and '*' alongside concrete profiles keeps the IN-clause behavior."""
+    conn = kbc.connect(board="default")
+    try:
+        tid = kb.create_task(conn, title="w2", assignee="worker")
+        kbn.add_notify_sub(
+            conn, task_id=tid, platform="_matrix", chat_id="c1",
+            notifier_profile="red",
+        )
+        kbn.add_notify_sub(
+            conn, task_id=tid, platform="_matrix", chat_id="c2",
+            notifier_profile="*",
+        )
+    finally:
+        conn.close()
+    # '*' + concrete → IN-clause (matches the '*'-stamped row only):
+    assert kbn.count_notify_subs(board="default", notifier_profiles=["*", "red"]) == 2

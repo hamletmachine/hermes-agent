@@ -153,6 +153,10 @@ def _notify_profile_filter(
     profiles = sorted({str(p).strip() for p in notifier_profiles if str(p).strip()})
     clauses: list[str] = []
     params: list[str] = []
+    if "*" in profiles and len(profiles) == 1:
+        # Standalone lock-holder wildcard: claim every stamped row (kanban_watchers_notifier
+        # documents why). Other gateway(s) behind the contended lock still filter strictly.
+        return "", []
     if profiles:
         clauses.append("notifier_profile IN (" + ",".join("?" for _ in profiles) + ")")
         params.extend(profiles)

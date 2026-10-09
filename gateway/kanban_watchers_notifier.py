@@ -232,6 +232,20 @@ class _Collector:
                 route.profile for route in config.profile_routes
                 if route.enabled and route.platform in _platform_names(runner.adapters)
             )
+        elif self.include_unowned:
+            # Standalone gateway (multiplex refused/off) holding the machine-global
+            # dispatcher lock: it serialises ALL gateways on this kanban root, so
+            # no competing notifier exists. Session auto-subscribe stamps rows with
+            # the CREATOR profile (kanban_tools._resolve_notify_target ->
+            # HERMES_SESSION_PROFILE), but this gateway's notifier only serves its
+            # own `_active_profile_name()` ('default' under the default home) — so
+            # legitimately-stamped foreign-profile rows (e.g. 'red') were skipped
+            # silently every tick, cursor frozen, no log below DEBUG (#59890 class).
+            # Under the singleton lock there is exactly one messenger for every
+            # chat this gateway's adapters serve, so claim ALL stamped rows; exact
+            # destination authorization still runs per-sub at claim and delivery,
+            # rewinding what it refuses. Multiplex keeps the strict profile filter.
+            self.notifier_profiles.add("*")  # marker honored in _notify_profile_filter
         # Include every platform any secondary profile has live. This is only a
         # coarse pre-filter; exact destination authorization runs before claim
         # and again at delivery, rewinding if the route or adapter changed.
