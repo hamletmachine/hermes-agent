@@ -403,13 +403,17 @@ class MemoryStore:
         def _apply(entries, limit):
             working = list(entries)  # only committed if the whole batch validates
             replaced = {}  # op index -> full entry text its replace overwrote (#117952)
+            op_deltas: List[Tuple[int, str, int]] = []  # (op#1-based, action, net chars)
             for i, op in enumerate(ops):
                 act = op.get("action")
+                size_before = len(ENTRY_DELIMITER.join(working))
                 msg, replaced_text = self._apply_batch_op(
                     working, act, (op.get("content") or op.get("new_text") or "").strip(),
                     (op.get("old_text") or "").strip(), f"Operation {i + 1} ({act or 'unknown'})")
                 if msg:
                     return self._batch_failure(target, msg)
+                op_deltas.append((i + 1, act or "?",
+                                  len(ENTRY_DELIMITER.join(working)) - size_before))
                 if replaced_text is not None:
                     # 1-based op position, matching the "Operation N" error numbering the
                     # model sees for failed ops in the same batch.
@@ -426,10 +430,16 @@ class MemoryStore:
                     f"final entry deliberately, use single remove() calls."))
             new_total = len(ENTRY_DELIMITER.join(working))  # budget check against the FINAL state only
             if new_total > limit:
+                # Per-op NET effect on the final state (#42637): op deltas vs the
+                # committed state, so a failed batch's retry names the offender
+                # instead of re-deriving the join arithmetic by trial and error.
+                delta_txt = ", ".join(
+                    f"op {n} ({act}): {'+' if d >= 0 else ''}{d}" for n, act, d in op_deltas)
                 return self._batch_failure(target, (
                     f"After applying all {len(operations)} operations, memory would be at "
                     f"{new_total:,}/{limit:,} chars -- over the limit. Remove or shorten more "
                     f"entries in the same batch, then retry.\n"
+                    f"Per-op net effect (adds minus removals): {delta_txt}.\n"
                     + self._budget_brief(target, self._entries_for(target), new_total)))
             replaced_fields = {"replaced_entries": replaced} if replaced else {}
             return working, f"Applied {len(operations)} operation(s).", replaced_fields
