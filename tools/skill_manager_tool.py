@@ -178,12 +178,18 @@ def _validate_frontmatter(content: str, *, new_skill: bool = False) -> Optional[
     if len(desc) > MAX_DESCRIPTION_LENGTH:
         return f"Description exceeds {MAX_DESCRIPTION_LENGTH} characters."
     if new_skill and len(desc.strip().strip("'\"")) > SKILL_PROMPT_DESC_LIMIT:
+        # 2026-10-09 monkeyhammer loop (session 02260176, 8 rejects ratcheting 132→63):
+        # the error reported only the LENGTH, so the agent had to re-guess its own string
+        # every attempt. Echo the offending description and the limit verbatim — one look
+        # is then sufficient to fix in the next attempt (contract test in tests/).
+        shown = desc.strip().strip("'\"")
         return (
             f"Description is {len(desc.strip())} chars — new skills must fit the "
             f"{SKILL_PROMPT_DESC_LIMIT}-char system-prompt budget (one sentence, trigger first, "
             f"ends with a period). The skill index truncates longer descriptions to "
             f"{SKILL_PROMPT_DESC_LIMIT - 3} chars + '...', destroying the routing signal. "
-            f"Move detail into the skill body.")
+            f"Offending description ({len(shown)} chars): \"{shown}\" — rewrite it to "
+            f"{SKILL_PROMPT_DESC_LIMIT} chars or fewer and move detail into the skill body.")
     if not content[end_match.end() + 3:].strip():
         return "SKILL.md must have content after the frontmatter (instructions, procedures, etc.)."
     return None
@@ -823,9 +829,10 @@ def _skill_manage_description(create_dir: str) -> str:
         "ops), patch (targeted old_string/new_string fix — preferred; "
         "content alone REPLACES the whole file, read it via skill_view() "
         "first), write_file/remove_file (supporting files), delete (sole "
-        "op only). Existing skills are modified wherever they live. Keep "
-        "the description's first 57 chars a self-contained trigger: 'Use "
-        "when <trigger>. <one-line behavior>.' Write lessons, not logs: "
+        "op only). Existing skills are modified wherever they live. The whole "
+        "description must be ONE sentence of at most 60 characters (hard "
+        "create-time limit), ending with a period, trigger first: 'Use when "
+        "<trigger>. <one-line behavior>.' Write lessons, not logs: "
         "imperative rule + why, no PR numbers/dates/incident narration, one "
         "rule per lesson, references/ named by topic (extend before adding). "
         "skill_view() shows format conventions."

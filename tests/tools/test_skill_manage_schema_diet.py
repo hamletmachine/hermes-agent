@@ -57,9 +57,13 @@ class TestSkillManageSchemaDiet(unittest.TestCase):
         desc = SKILL_MANAGE_SCHEMA["description"]
         # Maintainer-directed: no confirm-with-user coaching.
         self.assertNotIn("Confirm with the user", desc)
-        # Authoring curriculum compressed to the 57-char trigger rule +
-        # skill_view pointer; the numbered-steps/pitfalls list is gone.
-        self.assertIn("57 chars", desc)
+        # Authoring curriculum compressed to the description rule (one sentence,
+        # <=60 chars, hard create-time limit — corrected 2026-10-09 from the
+        # misleading 'first 57 chars' wording that caused an 8-reject authoring
+        # loop; error now echoes the offending text) + skill_view pointer;
+        # the numbered-steps/pitfalls list is gone.
+        self.assertIn("60 characters", desc)
+        self.assertIn("hard create-time limit", desc)
         self.assertIn("skill_view()", desc)
         self.assertNotIn("numbered steps", desc)
         # Stale action vocabulary must not return.
