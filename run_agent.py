@@ -1271,8 +1271,19 @@ class AIAgent(
         )
 
     def _append_guardrail_observation(self, tool_name: str, function_args: dict, function_result: str, *,
-                                      failed: bool, tool_call_id: str = "") -> str:
+                                      failed: bool, tool_call_id: str = "", tool_duration: float = 0.0) -> str:
         decision = self._tool_guardrails.after_call(tool_name, function_args, function_result, failed=failed)
+        # R2 wait budget: a completed wait-style call reports its wall-clock window
+        # against this turn's budget (agent layer — wait() has no turn context).
+        # Past the REFUSE tier the NEXT wait is refused (wait_budget_block_for).
+        try:
+            from agent.tool_guardrails import _is_wait_style_call
+            if _is_wait_style_call(tool_name, function_args if isinstance(function_args, dict) else {}):
+                wait_decision = self._tool_guardrails.observe_wait_window(tool_duration, failed=failed)
+                if wait_decision is not None and wait_decision.action in {"warn", "block"}:
+                    function_result = append_toolguard_guidance(function_result, wait_decision)
+        except Exception:
+            logger.debug("wait-budget observation failed: %s", tool_duration)
         # Session-scope Repeat Governor (R1): cross-turn identical-call/failure
         # detection. Observes the RAW result like the per-turn guards; a warn
         # decision appends guidance, a block decision parks in the controller and

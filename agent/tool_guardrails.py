@@ -100,6 +100,26 @@ SESSION_GOVERNOR_BUFFER_SIZE = 200
 # class — not the text — is the key. ``other`` still counts (it only ever widens).
 TOOL_FAILURE_CLASSES = frozenset({"auth", "not_found", "capacity", "validation", "timeout", "other"})
 
+# R2 — in-turn wait budget (review: two tiers, agent layer, NOT inside wait()).
+# ~100s cumulative: warn ("end the turn; you'll be notified"); ~150s: refuse
+# further wait-style calls with the notify/wake contract. A single cliff at 150
+# would punish one legitimate long wait (review change 2).
+TOOL_WAIT_BUDGET_WARN_SECONDS = 100
+TOOL_WAIT_BUDGET_REFUSE_SECONDS = 150
+
+_WAIT_BUDGET_WARN_MESSAGE = (
+    "[hermes note: this turn has already spent {seconds}s waiting on background processes "
+    "(budget {budget}s). End the turn instead of waiting again — with notify_on_complete you "
+    "will be notified on exit; do more work or finish your reply now.]"
+)
+
+_WAIT_BUDGET_REFUSE_MESSAGE = (
+    "Blocked wait: this turn has already spent {seconds}s waiting on background processes "
+    "(budget {budget}s). Do not wait again this turn — the process is still running and you "
+    "will be notified on exit (notify_on_complete / completion notification). Do more work or "
+    "end the turn now; the wake arrives on its own."
+)
+
 _FAILURE_CLASS_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("auth", ("unauthorized", "401", "invalid api key", "authentication", "permission", "forbidden", "403")),
     ("not_found", ("not found", "no such", "404", "does not exist", "unknown action", "unknown tool")),
@@ -120,6 +140,14 @@ _ATTENDED_PLATFORMS = frozenset({"cli", "tui", "desktop", "acp", "subagent", "ap
 def is_stall_guard_repeatable(tool_name: str) -> bool:
     """Whether a tool is exempt from the identical-call loop notice."""
     return tool_name in STALL_GUARD_REPEATABLE_TOOLS or tool_name.endswith(_STALL_GUARD_REPEATABLE_SUFFIXES)
+
+
+def _is_wait_style_call(tool_name: str, args: Mapping[str, Any]) -> bool:
+    """True for calls that BLOCK waiting on a background process (R2 budget):
+    ``process_manage action=wait``. Polls/logs are cheap observations, not waits."""
+    if tool_name not in STALL_GUARD_REPEATABLE_TOOLS:
+        return False
+    return str(args.get("action") or "").strip().lower() == "wait"
 
 
 def _is_non_interactive_platform(platform: str | None) -> bool:
@@ -413,6 +441,10 @@ class ToolCallGuardrailController:
         self._persisted_result_paths = self._persisted_result_paths_session
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
+        # R2 wait budget: cumulative seconds this turn spent in wait-style calls.
+        self._turn_wait_seconds = 0.0
+        # R2: parked refusal for the NEXT wait call (the current one already ran).
+        self._wait_refusal_pending = False
         # The turn epoch advances at reset_for_turn (every turn start / between the
         # caller's turns): the session governor's de-overlap gate compares epochs.
         self._session_turn_epoch += 1
@@ -723,6 +755,54 @@ class ToolCallGuardrailController:
             return None
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
         return self._session_block_pending.pop(signature, None)
+
+    # ── R2: agent-layer in-turn wait budget ───────────────────────────────────
+
+    def wait_budget_block_for(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision | None:
+        """The parked R2 refusal for a wait-style call about to dispatch, if any."""
+        if not self._wait_refusal_pending:
+            return None
+        if not _is_wait_style_call(tool_name, _coerce_args(args)):
+            return None
+        return ToolGuardrailDecision(
+            action="block", code="wait_budget_refused", tool_name=tool_name,
+            count=int(self._turn_wait_seconds), signature=ToolCallSignature.from_call(tool_name, _coerce_args(args)),
+            message=_WAIT_BUDGET_REFUSE_MESSAGE.format(
+                seconds=int(self._turn_wait_seconds), budget=TOOL_WAIT_BUDGET_REFUSE_SECONDS,
+            ),
+        )
+
+    def observe_wait_window(self, seconds: float, *, failed: bool = False) -> ToolGuardrailDecision | None:
+        """Record a completed wait-style call's wall-clock window against this
+        turn's budget (R2). Called from the runtime's post-call observation path —
+        NOT from ``process_registry.wait()``, which has no turn context. The wait
+        itself always runs; past the REFUSE tier the NEXT wait is refused
+        (parked decision consumed by the before-call gate).
+
+        Poller wait failures still count — the 12 timeout→re-poll rounds are the
+        pattern this budget exists to break (review: poller failures not exempt).
+        Returns a warn/block decision to append, or None."""
+        self._turn_wait_seconds += max(0.0, float(seconds or 0))
+        if self._turn_wait_seconds >= TOOL_WAIT_BUDGET_REFUSE_SECONDS:
+            # Park the refusal for the next wait-style call; the current result
+            # carries the block message so the model reads the contract NOW.
+            self._wait_refusal_pending = True
+            return ToolGuardrailDecision(
+                action="block", code="wait_budget_refused", tool_name="process_manage",
+                count=int(self._turn_wait_seconds), signature=None,
+                message=_WAIT_BUDGET_REFUSE_MESSAGE.format(
+                    seconds=int(self._turn_wait_seconds), budget=TOOL_WAIT_BUDGET_REFUSE_SECONDS,
+                ),
+            )
+        if self._turn_wait_seconds >= TOOL_WAIT_BUDGET_WARN_SECONDS:
+            return ToolGuardrailDecision(
+                action="warn", code="wait_budget_warning", tool_name="process_manage",
+                count=int(self._turn_wait_seconds), signature=None,
+                message=_WAIT_BUDGET_WARN_MESSAGE.format(
+                    seconds=int(self._turn_wait_seconds), budget=TOOL_WAIT_BUDGET_WARN_SECONDS,
+                ),
+            )
+        return None
 
     def record_persisted_result(self, tool_call_id: str, file_path: str) -> None:
         """Remember the spillover path a persisted result was saved to."""

@@ -699,6 +699,12 @@ def _dispatch_authorized_once(
     if block_message is None:
         guardrail_decision = agent._tool_guardrails.before_call(ref.name, ref.args)
         if guardrail_decision is not None and guardrail_decision.allows_execution:
+            # R2 wait budget: a parked refusal from the previous wait's observation
+            # gates THIS wait-style dispatch (the notify/wake contract replaces it).
+            wait_refusal = agent._tool_guardrails.wait_budget_block_for(ref.name, ref.args)
+            if wait_refusal is not None:
+                guardrail_decision = wait_refusal
+        if guardrail_decision is not None and guardrail_decision.allows_execution:
             # Session-scope Repeat Governor (R1): a parked cross-turn block from the
             # previous identical call's observation gates THIS dispatch.
             session_decision = agent._tool_guardrails.session_before_call(ref.name, ref.args)
@@ -1056,6 +1062,7 @@ def _commit_tool_result(
         if not blocked:
             function_result = agent._append_guardrail_observation(
                 function_name, function_args, function_result, failed=is_error, tool_call_id=tool_call_id,
+                tool_duration=tool_duration,
             )
         if is_error:
             logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, error_preview(function_result))

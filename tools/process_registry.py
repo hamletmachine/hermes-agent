@@ -2475,7 +2475,11 @@ PROCESS_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": "Max seconds for 'wait'.",
+                "description": (
+                    "Max seconds for 'wait'. Request 90s or less and end your turn: you are "
+                    "notified automatically on exit (notify_on_complete / completion "
+                    "notification), so long blocking waits waste the turn."
+                ),
                 "minimum": 1
             },
             "offset": {
