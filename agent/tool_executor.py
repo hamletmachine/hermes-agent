@@ -698,7 +698,13 @@ def _dispatch_authorized_once(
     guardrail_decision = None
     if block_message is None:
         guardrail_decision = agent._tool_guardrails.before_call(ref.name, ref.args)
-        if guardrail_decision.allows_execution:
+        if guardrail_decision is not None and guardrail_decision.allows_execution:
+            # Session-scope Repeat Governor (R1): a parked cross-turn block from the
+            # previous identical call's observation gates THIS dispatch.
+            session_decision = agent._tool_guardrails.session_before_call(ref.name, ref.args)
+            if session_decision is not None:
+                guardrail_decision = session_decision
+        if guardrail_decision is not None and guardrail_decision.allows_execution:
             guardrail_decision = None
 
     if block_message is not None or guardrail_decision is not None:

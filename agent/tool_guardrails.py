@@ -9,12 +9,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections import deque
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Mapping
 
 from utils import safe_json_loads
-from agent.tool_result_classification import file_mutation_result_landed, is_guardrail_refusal
+from agent.tool_result_classification import (
+    GUARDRAIL_REFUSAL_KEY,
+    file_mutation_result_landed,
+    is_guardrail_refusal,
+)
 
 
 IDEMPOTENT_TOOL_NAMES = frozenset({
@@ -65,7 +70,7 @@ PROGRESS_RESET_TOOL_NAMES = frozenset({
     "cronjob_manage", "todo", "todo_list", "memory", "skill_manage",
 })
 
-_BOOL_FIELDS = ("warnings_enabled", "hard_stop_enabled", "non_interactive_hard_stop_enabled")
+_BOOL_FIELDS = ("warnings_enabled", "hard_stop_enabled", "non_interactive_hard_stop_enabled", "session_governor_enabled")
 # Threshold field -> (nested section, nested key). The flat legacy key is the field name itself.
 _THRESHOLD_SOURCES: dict[str, tuple[str, str]] = {
     "exact_failure_warn_after": ("warn_after", "exact_failure"),
@@ -74,7 +79,34 @@ _THRESHOLD_SOURCES: dict[str, tuple[str, str]] = {
     "exact_failure_block_after": ("hard_stop_after", "exact_failure"),
     "same_tool_failure_halt_after": ("hard_stop_after", "same_tool_failure"),
     "no_progress_block_after": ("hard_stop_after", "idempotent_no_progress"),
+    # Session-scope Repeat Governor (R1): lives under its own nested section so the
+    # per-turn ``warn_after`` keys never collide. ``0`` disables a tier.
+    "session_warn_after": ("session", "warn_after"),
+    "session_block_after": ("session", "block_after"),
 }
+
+# Defaults for the session-scope Repeat Governor (R1): the notice tier fires on the
+# 2nd cross-turn identical call, the block tier on the 3rd — mirroring the per-turn
+# no-progress ladder (warn 2 / block 5 would over-block legitimate cross-turn
+# re-reads; the session scope is strictly more aggressive, so start softer).
+_SESSION_WARN_AFTER_DEFAULT = 2
+_SESSION_BLOCK_AFTER_DEFAULT = 3
+# Bounded ring buffer (review change 2a): stale pointers age out instead of growing
+# unbounded across a 24h session.
+SESSION_GOVERNOR_BUFFER_SIZE = 200
+
+# Failure-class enum for the session governor's failure hashing (review change 4):
+# payloads that embed mutating counters/timestamps must hash identically, so the
+# class — not the text — is the key. ``other`` still counts (it only ever widens).
+TOOL_FAILURE_CLASSES = frozenset({"auth", "not_found", "capacity", "validation", "timeout", "other"})
+
+_FAILURE_CLASS_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("auth", ("unauthorized", "401", "invalid api key", "authentication", "permission", "forbidden", "403")),
+    ("not_found", ("not found", "no such", "404", "does not exist", "unknown action", "unknown tool")),
+    ("capacity", ("exceed the limit", "limit reached", "too large", "quota", "429", "rate limit", "exceed")),
+    ("timeout", ("timed out", "timeout", "deadline exceeded")),
+    ("validation", ("is required", "invalid", "must be", "cannot", "expected", "400", "validation")),
+)
 
 # Per-turn caps on runaway-prone tools (counters reset in reset_for_turn).
 _DEFAULT_MAX_WEB_SEARCHES_PER_TURN = 50
@@ -130,6 +162,12 @@ class ToolCallGuardrailConfig:
     idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
     mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
     loop_caps: LoopCapConfig = field(default_factory=LoopCapConfig)
+    # Session-scope Repeat Governor (R1): master switch + cross-turn thresholds.
+    # ``0`` disables a tier (via _int_at_least minimum=0); the master switch kills
+    # every session decision without touching the per-turn detectors.
+    session_governor_enabled: bool = True
+    session_warn_after: int = _SESSION_WARN_AFTER_DEFAULT
+    session_block_after: int = _SESSION_BLOCK_AFTER_DEFAULT
 
     @classmethod
     def from_mapping(
@@ -143,10 +181,12 @@ class ToolCallGuardrailConfig:
         if flags["non_interactive_hard_stop_enabled"] and _is_non_interactive_platform(platform):
             flags["hard_stop_enabled"] = True
 
-        def threshold(name: str, section_name: str, key: str) -> int:
+        def threshold(name: str, section_name: str, key: str, *, minimum: int = 1) -> int:
             section = data.get(section_name)
             nested = section.get(key, data.get(name)) if isinstance(section, Mapping) else data.get(name)
-            return _int_at_least(nested, getattr(d, name), 1)
+            # Session governor tiers honor explicit 0 = disabled (review change 7);
+            # per-turn thresholds keep minimum 1 (0 would mean block on first call).
+            return _int_at_least(nested, getattr(d, name), 0 if name.startswith("session_") else 1)
 
         thresholds = {name: threshold(name, *src) for name, src in _THRESHOLD_SOURCES.items()}
         return cls(loop_caps=LoopCapConfig.from_mapping(data.get("loop_caps")), **flags, **thresholds)
@@ -307,6 +347,42 @@ class ToolCallGuardrailController:
 
     def __init__(self, config: ToolCallGuardrailConfig | None = None):
         self.config = config or ToolCallGuardrailConfig()
+        self._init_session_state()
+        self.reset_for_turn()
+
+    def _init_session_state(self) -> None:
+        """Session-scope Repeat Governor state (R1) — lives OUTSIDE reset_for_turn()
+        so cross-turn loops stay visible; ``reset_for_session()`` clears it at
+        agent init / new session."""
+        # Ring buffer of (signature, result_hash_or_failure_class, failed, turn_epoch).
+        # Bounded (SESSION_GOVERNOR_BUFFER_SIZE): stale entries age out so a compaction
+        # can't leave dangling pointers living forever (review change 2a).
+        self._session_buffer: deque[tuple[ToolCallSignature, str, bool, int]] = deque(maxlen=SESSION_GOVERNOR_BUFFER_SIZE)
+        # Per-turn epoch counter: the de-overlap gate (review change 1). A session
+        # decision fires only when the PREVIOUS identical call happened in an
+        # EARLIER turn — within a turn, the existing per-turn stub/notice stands.
+        self._session_turn_epoch = 0
+        # signature -> last turn_epoch it was seen in (for the de-overlap gate).
+        self._session_last_seen: dict[ToolCallSignature, int] = {}
+        # signature -> cross-turn identical-call count (success AND failure paths).
+        self._session_counts: dict[ToolCallSignature, int] = {}
+        # signature -> the FIRST observation's result preview/failure-class, so the
+        # notice/block can point at the earlier result (review R1 design).
+        self._session_first_result: dict[ToolCallSignature, str] = {}
+        # signature -> turn epoch of the last successful PROGRESS_RESET call; mirrors
+        # the per-turn _progress_since_failure, session-scoped (review change 3).
+        self._session_progress_epoch: dict[ToolCallSignature, int] = {}
+        # Session-scoped persisted-path pointers (A1): a stub referencing a spillover
+        # file must not dangle just because the turn ended.
+        self._persisted_result_paths_session: dict[str, str] = {}
+        # Parked block decisions from session_observe: signature -> decision, consumed
+        # by the runtime's before-call gate on the NEXT identical call.
+        self._session_block_pending: dict[ToolCallSignature, ToolGuardrailDecision] = {}
+
+    def reset_for_session(self) -> None:
+        """Clear ALL state including the session-scope governor. Called at agent
+        init / new session — never per turn."""
+        self._init_session_state()
         self.reset_for_turn()
 
     def reset_for_turn(self) -> None:
@@ -332,9 +408,14 @@ class ToolCallGuardrailController:
         # multi-call cycle (A,B,A,B,...) is caught even though it resets the consecutive streak above.
         self._call_history: deque[tuple[ToolCallSignature, str, bool]] = deque(maxlen=_STALL_GUARD_CYCLE_HISTORY)
         # tool_call_id -> spillover path, so a stub referencing a persisted-output preview can't dangle.
-        self._persisted_result_paths: dict[str, str] = {}
+        # Session-scoped as of R1/A1 (the governor points at these files across turns);
+        # the per-turn map below is kept as the alias ``_persisted_result_paths`` reads/writes go through.
+        self._persisted_result_paths = self._persisted_result_paths_session
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
+        # The turn epoch advances at reset_for_turn (every turn start / between the
+        # caller's turns): the session governor's de-overlap gate compares epochs.
+        self._session_turn_epoch += 1
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
@@ -520,6 +601,129 @@ class ToolCallGuardrailController:
                 return period, laps
         return None
 
+    # ── Session-scope Repeat Governor (R1) ────────────────────────────────────
+
+    def session_observe(
+        self, tool_name: str, args: Mapping[str, Any] | None, result: Any,
+        *, failed: bool = False,
+    ) -> ToolGuardrailDecision:
+        """Cross-turn repeat detector: the per-turn detectors are wiped by
+        ``reset_for_turn()`` at every turn start, so 83% of red's repeats (multi-hour
+        loops across turns) were invisible. This tracks (tool, args-hash,
+        result-hash | failure-class) in a session-scoped ring buffer and returns
+        warn/block decisions on the ``session.warn_after`` / ``session.block_after``
+        thresholds.
+
+        Gates (review changes 1-7):
+        - De-overlap: fires only when the previous identical call happened in an
+          EARLIER turn (turn-epoch compare) — within a turn the per-turn stub/notice
+          already handles it.
+        - Progress reset: a successful call to a PROGRESS_RESET_TOOL_NAMES tool
+          after the signature's last failure makes the next retry a new experiment.
+        - Failure-class hashing: ``classify_tool_failure`` stays the failure
+          detector; the session key normalizes the payload to a class so mutating
+          counters/timestamps ("failed 4 times" -> "5 times") can't defeat the hash.
+        - Pollers are exempt from the SUCCESS-repeat tier ONLY: an identical
+          failing poller result still counts (12 wait timeouts -> re-poll).
+        - Count-before-gate: the observation is recorded BEFORE the block decision
+          is built, so the first blocked call is never unrecorded (A3).
+        """
+        allow = ToolGuardrailDecision(tool_name=tool_name, signature=ToolCallSignature.from_call(tool_name, _coerce_args(args)))
+        if not self.config.session_governor_enabled:
+            return allow
+        signature = allow.signature
+        # Progress reset (review change 3): a successful call to a PROGRESS_RESET
+        # tool marks progress for every signature still counted — stamped with the
+        # CURRENT epoch so the check below can compare "reset happened after the
+        # previous identical failure".
+        if not failed and tool_name in PROGRESS_RESET_TOOL_NAMES:
+            for counted_sig in self._session_counts:
+                self._session_progress_epoch[counted_sig] = self._session_turn_epoch
+        if failed:
+            failure_class = _failure_class(tool_name, result if isinstance(result, str) else "")
+            value = f"fail:{failure_class}"
+        else:
+            # A2: non-string (multimodal) results hash instead of being exempt.
+            value = f"ok:{_result_hash(result if isinstance(result, str) else _canonical_json(result))}"
+
+        epoch_now = self._session_turn_epoch
+        previous_epoch = self._session_last_seen.get(signature)
+        previous_value = self._session_first_result.get(signature)
+
+        # Record BEFORE deciding (A3): a blocked repeat still advances the count.
+        self._session_buffer.append((signature, value, failed, epoch_now))
+        self._session_last_seen[signature] = epoch_now
+        if previous_value is None:
+            self._session_first_result[signature] = value
+
+        if previous_epoch is None or previous_value != value:
+            # First sighting this session, or the result/class changed — no repeat.
+            self._session_counts.pop(signature, None)
+            return allow
+
+        # De-overlap gate (review change 1): the previous identical call must have
+        # happened in an EARLIER turn. Within one turn the existing per-turn
+        # stub/notice handles the repeat; the session governor stays out.
+        if previous_epoch >= epoch_now:
+            return allow
+
+        if self._session_progress_epoch.get(signature, -1) >= previous_epoch and (
+            failed or tool_name not in PROGRESS_RESET_TOOL_NAMES
+        ):
+            # A mutation succeeded after the previous identical call: the retry is a
+            # new experiment (review change 3), restart the count. Applies to the
+            # failure tier unconditionally and to the success tier when THIS call is
+            # not itself the progress-resetting mutation.
+            self._session_counts.pop(signature, None)
+            self._session_first_result[signature] = value
+            return allow
+
+        count = self._session_counts[signature] = self._session_counts.get(signature, 0) + 1
+
+        # Poller exemption, SUCCESS tier only (review change 6): an unchanged poll
+        # is legitimate waiting; an unchanged FAILURE still counts.
+        if not failed and is_stall_guard_repeatable(tool_name):
+            return allow
+
+        if self.config.session_block_after and count + 1 >= self.config.session_block_after:
+            # The current call already executed — the block prevents the NEXT
+            # identical one. Park it for the runtime's before-call gate (NOT
+            # _decide: that would set _halt_decision and misreport the completed
+            # call as a turn halt).
+            decision = ToolGuardrailDecision(
+                action="block", code="session_repeat_block", tool_name=tool_name, count=count + 1,
+                signature=signature,
+                message=_session_repeat_message(tool_name, count + 1, failed, previous_value, self._persisted_result_paths),
+            )
+            self._session_block_pending[signature] = decision
+            return decision
+        if self.config.session_warn_after and count + 1 >= self.config.session_warn_after:
+            return self._decide(
+                "warn", "session_repeat_notice", tool_name, count + 1, signature,
+                message=_session_repeat_message(tool_name, count + 1, failed, previous_value, self._persisted_result_paths),
+            )
+        return allow
+
+    def session_block_for(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision | None:
+        """The pending session-governor BLOCK for this exact call, if any.
+
+        The governor observes post-call (it needs the result), but its block must
+        prevent the NEXT execution — so a block decision is parked here and
+        ``before_call`` consults this before allowing. Mirrors
+        ``_check_loop_cap``'s count-before-gate ordering (A3)."""
+        if not self.config.session_governor_enabled:
+            return None
+        signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
+        return self._session_block_pending.get(signature)
+
+    def session_before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision | None:
+        """Consume the pending session block for this call (called by the runtime's
+        before-call gate). Returns the parked decision exactly once."""
+        if not self.config.session_governor_enabled:
+            return None
+        signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
+        return self._session_block_pending.pop(signature, None)
+
     def record_persisted_result(self, tool_call_id: str, file_path: str) -> None:
         """Remember the spillover path a persisted result was saved to."""
         if tool_call_id and file_path:
@@ -560,8 +764,17 @@ class ToolCallGuardrailController:
 
 
 def toolguard_synthetic_result(decision: ToolGuardrailDecision) -> str:
-    """Build a synthetic role=tool content string for a blocked tool call."""
-    return json.dumps({"error": decision.message, "guardrail": decision.to_metadata()}, ensure_ascii=False)
+    """Build a synthetic role=tool content string for a blocked tool call.
+
+    Carries ``guardrail_refusal: True``: a harness REFUSAL of a redundant call is
+    not a failure the tool hit — without the marker the failure classifiers count
+    the block and the cheap refusal feeds the very streak that fired it (review
+    change 5 / agent.tool_result_classification.GUARDRAIL_REFUSAL_KEY)."""
+    return json.dumps(
+        {"error": decision.message, "guardrail": decision.to_metadata(),
+         GUARDRAIL_REFUSAL_KEY: True},
+        ensure_ascii=False,
+    )
 
 
 def append_toolguard_guidance(result: str, decision: ToolGuardrailDecision) -> str:
@@ -594,6 +807,75 @@ def _tool_failure_recovery_hint(tool_name: str, count: int) -> str:
 
 def _ordinal(count: int) -> str:
     return f"{count}{'th' if 11 <= count % 100 <= 13 else {1: 'st', 2: 'nd', 3: 'rd'}.get(count % 10, 'th')}"
+
+
+def _failure_class(tool_name: str, result: str | None) -> str:
+    """Failure-class enum for session hashing (review change 4): strips digits/
+    timestamps by construction — the class, not the text, is the key. Digits in
+    patterns like '401'/'429' are STATUS CLASSES, not counters; a mutating
+    counter ("failed 4 times" -> "5 times") maps to the same class either way."""
+    if not result:
+        return "other"
+    lowered = result[:2000].lower()
+    # Strip digits that are NOT status codes: counter defeats embed "N times".
+    normalized = re.sub(r"\b\d+\b(?= (?:times|attempts|tries))", "N", lowered)
+    for failure_class, patterns in _FAILURE_CLASS_PATTERNS:
+        if any(p in normalized for p in patterns):
+            return failure_class
+    return "other"
+
+
+_SESSION_REPEAT_SUCCESS_MESSAGE = (
+    "[hermes note: {tool_name} was already called with these exact arguments earlier in this "
+    "session ({ordinal} cross-turn repeat) and returned the same result — the result above is "
+    "unchanged. Do not re-run it unchanged; use the earlier result or change the query.]"
+)
+
+_SESSION_REPEAT_FAILURE_MESSAGE = (
+    "[hermes note: {tool_name} already failed with these exact arguments earlier in this session "
+    "({ordinal} cross-turn repeat, failure class: {failure_class}). The identical retry will fail "
+    "the same way. Change strategy instead of repeating the call unchanged.]"
+)
+
+_SESSION_REPEAT_BLOCK_MESSAGE = (
+    "Blocked {tool_name}: this exact call already ran {count} times this session with identical "
+    "arguments and {result_phrase}. {change_advice}"
+)
+
+_RESULT_PHRASE_SUCCESS = "returned the same result"
+_RESULT_PHRASE_FAILURE = "failed with the same error class (see the earlier result above)"
+
+_SESSION_PERSISTED_PATH_NOTE = (
+    "\nThe earlier result was persisted to {path} — page through it with read_file if you need the full content."
+)
+
+
+def _session_repeat_message(
+    tool_name: str, count: int, failed: bool, previous_value: str | None,
+    persisted_paths: Mapping[str, str] | None = None,
+) -> str:
+    """Session-governor notice/block text. Tiers share one builder: the notice
+    points at the earlier result, the block refuses and cites it."""
+    failure_class = previous_value[5:] if previous_value and previous_value.startswith("fail:") else "other"
+    if failed:
+        change_advice = "Change strategy instead of repeating the call unchanged."
+        result_phrase = _RESULT_PHRASE_FAILURE
+        text = _SESSION_REPEAT_FAILURE_MESSAGE.format(tool_name=tool_name, ordinal=_ordinal(count), failure_class=failure_class)
+    else:
+        change_advice = "Use the result already provided or try a different query."
+        result_phrase = _RESULT_PHRASE_SUCCESS
+        text = _SESSION_REPEAT_SUCCESS_MESSAGE.format(tool_name=tool_name, ordinal=_ordinal(count))
+    if count >= 3:
+        text = _SESSION_REPEAT_BLOCK_MESSAGE.format(
+            tool_name=tool_name, count=count, result_phrase=result_phrase, change_advice=change_advice,
+        )
+        # Point at the persisted spillover when one exists for any observed call
+        # (dangling-reference mitigation, review change 2b): the LAST recorded path
+        # is the best pointer for this signature's repeated reads.
+        if persisted_paths:
+            path = next(iter(persisted_paths.values()))
+            text += _SESSION_PERSISTED_PATH_NOTE.format(path=path)
+    return text
 
 
 def _coerce_args(args: Mapping[str, Any] | None) -> Mapping[str, Any]:

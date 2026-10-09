@@ -548,6 +548,13 @@ DEFAULT_CONFIG = {
             "max_web_searches": 50,   # web_search calls per turn
             "max_subagents": 50,      # subagents spawned per turn
         },
+        # Session-scope Repeat Governor: cross-turn identical-call/failure detection the
+        # per-turn detectors above cannot see (state survives reset_for_turn). Fires a
+        # notice on the session_warn_after-th cross-turn repeat with an identical result,
+        # blocks on the session_block_after-th. 0 disables a tier;
+        # session_governor_enabled: false kills the whole governor.
+        "session_governor_enabled": True,
+        "session": {"warn_after": 2, "block_after": 3},
     },
 
     "compression": {

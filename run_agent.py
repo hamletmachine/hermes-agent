@@ -1273,6 +1273,20 @@ class AIAgent(
     def _append_guardrail_observation(self, tool_name: str, function_args: dict, function_result: str, *,
                                       failed: bool, tool_call_id: str = "") -> str:
         decision = self._tool_guardrails.after_call(tool_name, function_args, function_result, failed=failed)
+        # Session-scope Repeat Governor (R1): cross-turn identical-call/failure
+        # detection. Observes the RAW result like the per-turn guards; a warn
+        # decision appends guidance, a block decision parks in the controller and
+        # gates the NEXT identical call (session_before_call in tool_executor).
+        try:
+            session_decision = self._tool_guardrails.session_observe(
+                tool_name, function_args, function_result if isinstance(function_result, str) else None,
+                failed=failed,
+            )
+            if session_decision is not None and session_decision.action == "warn":
+                function_result = append_toolguard_guidance(function_result, session_decision)
+        except Exception:
+            logger.debug("session repeat governor observation failed: %s",
+                         getattr(self._tool_guardrails, "_session_turn_epoch", None))
         # Identical-call stall guards observe the RAW result (before the per-call loop suffix) and are applied
         # at result construction so tool results stay append-only / cache-safe.
         stall_notice = result_stub = None
