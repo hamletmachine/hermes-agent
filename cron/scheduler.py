@@ -2344,9 +2344,7 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
 
     # resolve_turn_limit() honors none/unlimited (sys.maxsize) and explicit 0 / null.
     from hermes_cli.config import resolve_turn_limit as _resolve_turn_limit
-    _mt = _cfg.get("agent", {}).get("max_turns")
-    if _mt is None:
-        _mt = _cfg.get("max_turns")
+    _mt = _resolve_job_turn_cap(job, _cfg)
     setup.max_iterations = _resolve_turn_limit(_mt)
 
     # Runtime backstop (CWE-200/522): fail closed BEFORE resolution on a provider/base_url pair
@@ -2373,6 +2371,21 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
         if _mcp_reason:
             setup.blocked = _blocked_config_result(job_id, job_name, _mcp_reason)
     return setup
+
+
+def _resolve_job_turn_cap(job: dict, cfg: dict) -> Any:
+    """Per-job turn cap resolution (C2): the job's ``max_turns`` field when set,
+    else the profile ``agent.max_turns`` (legacy flat ``max_turns`` honored) —
+    byte-identical fallback for jobs without the field. The returned raw value
+    still goes through ``resolve_turn_limit`` (none/unlimited/0/null semantics)."""
+    job_cap = (job or {}).get("max_turns")
+    if job_cap is not None:
+        return job_cap
+    _cfg = cfg or {}
+    _mt = (_cfg.get("agent", {}) or {}).get("max_turns")
+    if _mt is None:
+        _mt = _cfg.get("max_turns")
+    return _mt
 
 
 def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup, *, workdir, session_id, session_db):

@@ -1640,6 +1640,24 @@ def _normalize_reasoning_effort(value: Any) -> Optional[str]:
 
 # Normalizers for create_job (all fields) / update_job (present fields). Invalid values raise BEFORE
 # storing.
+def _normalize_job_max_turns(value: Any) -> Optional[int]:
+    """Per-job turn cap (C2): positive int or None (unset -> profile agent.max_turns).
+    Floats with fractional parts are rejected: a cap of 40.5 is a config error."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"Invalid max_turns {value!r}: expected a positive integer or null.")
+    if isinstance(value, float) and not value.is_integer():
+        raise ValueError(f"Invalid max_turns {value!r}: expected a positive integer or null.")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid max_turns {value!r}: expected a positive integer or null.")
+    if parsed <= 0:
+        raise ValueError(f"Invalid max_turns {value!r}: expected a positive integer or null.")
+    return parsed
+
+
 _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "model": _normalize_job_optional_text,
     "provider": _normalize_job_optional_text,
@@ -1652,12 +1670,14 @@ _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "no_agent": bool,
     "context_from": _normalize_context_from,
     "failure_deliver": _normalize_failure_deliver,
+    "max_turns": _normalize_job_max_turns,
 }
 _UPDATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "workdir": lambda v: None if v in {None, "", False} else _normalize_workdir(v),
     "monitor_script": _normalize_job_optional_text,
     "monitor_url": _normalize_job_optional_text,
     "reasoning_effort": _normalize_reasoning_effort,
+    "max_turns": _normalize_job_max_turns,
 }
 
 
@@ -1725,6 +1745,7 @@ def create_job(
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     failure_deliver: Optional[str] = None,
+    max_turns: Optional[int] = None,
     paused: bool = False,
     paused_reason: Optional[str] = None,
     pinned: bool = False,
@@ -1817,11 +1838,12 @@ def create_job(
         "workdir": f["workdir"],
     }
     # Optional keys are persisted only when explicitly set: an absent key falls back to global
-    # config (attach/reasoning) or to ``deliver`` (failure_deliver), byte-identical to pre-feature
-    # jobs.
+    # config (attach/reasoning) or to ``deliver`` (failure_deliver) or to the profile
+    # agent.max_turns (max_turns), byte-identical to pre-feature jobs.
     for key, value in (
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
         ("failure_deliver", f["failure_deliver"]),
+        ("max_turns", f.get("max_turns")),
     ):
         if value is not None:
             job[key] = value
