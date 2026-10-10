@@ -579,6 +579,10 @@ def _reset_per_turn_agent_state(agent: Any) -> None:
     """Reset retry counters, guardrails, iteration and run budgets at turn start."""
     for name, value in _PER_TURN_RESET_STATE:
         setattr(agent, name, value)
+    # R4: the silent-streak one-shot notice flag resets per turn; the streak count
+    # itself is reset by visible content (note_round_visibility), not by the turn.
+    from agent.silent_streak import reset_silent_streak_for_turn
+    reset_silent_streak_for_turn(agent)
     agent._turn_failed_file_mutations = {}
     agent._turn_file_mutation_paths = set()
     agent._tool_guardrails.reset_for_turn()

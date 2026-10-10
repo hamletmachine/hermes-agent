@@ -80,6 +80,10 @@ class ExitFailure(NamedTuple):
 _EXIT_REASON_FAILURES: Tuple[Tuple[str, str, bool, bool], ...] = (
     # Advisory: the reasoning-only text may literally be the answer, and cron stays silent.
     ("empty_response_exhausted", "empty_response", True, False),
+    # Advisory (R4 silent-streak checkpoint): the run executed silently and must
+    # REPORT, not confess failure — a cron/kanban hard-end at the checkpoint is a
+    # progress report, parallel to the persistence-failure break path.
+    ("silent_streak_finalize", "empty_response", False, False),
     ("all_retries_exhausted_no_response", FailoverReason.server_error.value, True, True),
     ("interpreter_shutdown", "interpreter_shutdown", False, True),
     # Advisory: a deterministic local bug is not a task failure for the kanban breaker.

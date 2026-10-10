@@ -29,6 +29,25 @@ ITERATION_BUDGET_WARNING_TEMPLATE = (
 )
 
 
+def _append_one_shot_notice(agent: Any, messages: Any, notice: str) -> bool:
+    """Cache-safe one-shot injection (R4 shares the iteration-budget pattern):
+    append to the newest, NOT-yet-persisted tool result only — never rewrite a
+    cached (already persisted) row, never a synthetic user/system row."""
+    from agent.context_compressor import _DB_PERSISTED_MARKER
+    if (not messages or messages[-1].get("role") != "tool"
+            or messages[-1].get(_DB_PERSISTED_MARKER)):
+        return False
+    message = messages[-1]
+    content = message.get("content", "")
+    if isinstance(content, str):
+        message["content"] = content + f"\n\n{notice}"
+    elif isinstance(content, list) or content is None:
+        message["content"] = [*(content or []), {"type": "text", "text": notice}]
+    else:
+        return False
+    return True
+
+
 def _maybe_inject_iteration_budget_warning(agent: Any, messages: Any) -> bool:
     """Append the opt-in one-shot warning to the newest tool result."""
     import os
@@ -67,17 +86,7 @@ def _maybe_inject_iteration_budget_warning(agent: Any, messages: Any) -> bool:
             "continue. A diff or commit alone is not completion evidence."
         )
     # Only the current tool-result tail is mutable; an older turn may already be cached.
-    from agent.context_compressor import _DB_PERSISTED_MARKER
-    if (not messages or messages[-1].get("role") != "tool"
-            or messages[-1].get(_DB_PERSISTED_MARKER)):
-        return False
-    message = messages[-1]
-    content = message.get("content", "")
-    if isinstance(content, str):
-        message["content"] = content + f"\n\n{notice}"
-    elif isinstance(content, list) or content is None:
-        message["content"] = [*(content or []), {"type": "text", "text": notice}]
-    else:
+    if not _append_one_shot_notice(agent, messages, notice):
         return False
     agent._iteration_budget_warning_injected = True
     return True
@@ -145,6 +154,16 @@ def prepare_iteration(
 
     # Appended to the newest tool result; never a synthetic user/system row.
     _maybe_inject_iteration_budget_warning(agent, messages)
+
+    # R4 silent-streak checkpoint: one-shot notice on the same tail-append pattern.
+    try:
+        from agent.silent_streak import SILENT_STREAK_NOTICE_TEMPLATE, silent_streak_checkpoint_due
+        if silent_streak_checkpoint_due(agent):
+            _append_one_shot_notice(agent, messages, SILENT_STREAK_NOTICE_TEMPLATE.format(
+                count=getattr(agent, "_silent_round_count", 0),
+            ))
+    except Exception:
+        logger.debug("silent-streak notice injection failed", exc_info=True)
 
     request_logger = getattr(agent, "logger", None) or logger  # same name as the origin module
     # Per-agent validation cursor skips re-parsing tool_call args already validated.

@@ -175,6 +175,36 @@ def run_tool_round(
                     agent.stream_delta_callback(None)
         return _verdict("break")
 
+    # R4 silent-streak hard end (cron/kanban only): the run stayed silent past its
+    # checkpoint. This is a turn FINALIZE — a progress report with a distinct exit
+    # reason — NOT a guardrail halt: "I stopped retrying" would misreport a
+    # checkpoint as failure. Parallel to the persistence-failure break above.
+    try:
+        from agent.silent_streak import (
+            SILENT_STREAK_FINALIZE_EXIT_REASON,
+            silent_streak_hard_end_eligible,
+        )
+        if silent_streak_hard_end_eligible(agent):
+            _turn_exit_reason = SILENT_STREAK_FINALIZE_EXIT_REASON
+            count = getattr(agent, "_silent_round_count", 0)
+            final_response = (
+                f"[silent-streak finalize] {count} iterations ran without user-visible output; "
+                "ending the turn to report progress. Durable state above shows what completed — "
+                "send a follow-up message to continue."
+            )
+            append_message(messages, {"role": "assistant", "content": final_response})
+            if not agent.quiet_mode:
+                agent._safe_print(f"\n{final_response}\n", diagnostic=True)
+                if agent.stream_delta_callback:
+                    with suppress(Exception):
+                        agent.stream_delta_callback(final_response)
+                        agent.stream_delta_callback(None)
+            agent._emit_diagnostic_status(
+                f"⏹️ Silent-streak finalize after {count} silent iterations")
+            return _verdict("break")
+    except Exception:
+        logger.debug("silent-streak hard-end check failed", exc_info=True)
+
     # Reset per-turn retry counters so one truncation can't poison the turn.
     truncated_tool_call_retries = 0
     # Defer the paragraph break: _fire_stream_delta() prepends one "\n\n" when real
@@ -239,6 +269,14 @@ def stage_tool_call_message(
         )
         turn_content = ""
         assistant_msg["content"] = ""
+
+    # R4 silent-streak tracking (agent/silent_streak.py): a round whose visible
+    # content is empty is a silent round; any visible text resets the streak.
+    try:
+        from agent.silent_streak import note_round_visibility
+        note_round_visibility(agent, silent=not (turn_content and turn_content.strip()))
+    except Exception:
+        logger.debug("silent-streak tracking failed", exc_info=True)
 
     # Classify tools regardless of visible content: a substantive tool-only turn must
     # invalidate any older housekeeping fallback (so a two-turn-old housekeeping
