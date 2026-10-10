@@ -97,6 +97,15 @@ class ProviderProfile:
     # top-level fields rather than ignoring them.
     supports_prompt_cache_key: bool = False
 
+    # True when the Chat Completions endpoint accepts the top-level
+    # ``parallel_tool_calls`` request field (OpenAI and honest OpenAI-compatible
+    # relays honor it; strict endpoints reject unknown top-level fields with
+    # HTTP 400/422 — the same failure class as reasoning_details). Deliberately
+    # opt-in and capability-gated: never send it blind. When True and tools are
+    # present, the chat-completions transport sends ``parallel_tool_calls: true``
+    # so batching depends on the model, not the provider's silent default (C1).
+    supports_parallel_tool_calls: bool = False
+
     # Private replay carriers use a namespaced '<provider>.native_assistant' type
     # in reasoning_details. Only this profile may receive its matching carrier;
     # other providers (including an unregistered fallback) get ordinary details only.

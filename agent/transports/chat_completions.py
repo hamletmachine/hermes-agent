@@ -255,6 +255,49 @@ def _model_consumes_thought_signature(model: Any) -> bool:
     return "gemini" in m or "gemma" in m
 
 
+def _parallel_tool_calls_flag(model: Any, profile: Any = None, model_override: Any = None) -> bool | None:
+    """The ``parallel_tool_calls`` value for this request, or None = omit (C1).
+
+    Resolution: the explicit ``model.parallel_tool_calls`` user override
+    (``auto|true|false``) WINS over the profile capability; ``auto``/UNSET omits
+    the key and trusts the provider default. Without an override, the flag rides
+    the profile's ``supports_parallel_tool_calls`` capability gate — strict
+    endpoints 400 on unknown top-level fields (reasoning_details class), so it
+    is never sent blind. No tools -> None (same rule as the codex path).
+    """
+    override = model_override if model_override is not None else _model_parallel_tool_calls_override(model)
+    if override is not None:
+        if isinstance(override, str):
+            lowered = override.strip().lower()
+            if lowered in {"auto", ""}:
+                return None
+            if lowered in {"true", "1", "yes", "on"}:
+                return True
+            if lowered in {"false", "0", "no", "off"}:
+                return False
+            return None
+        return bool(override)
+    if profile is not None and getattr(profile, "supports_parallel_tool_calls", False):
+        return True
+    return None
+
+
+def _model_parallel_tool_calls_override(model: Any = None, provider: Any = None) -> Any:
+    """The ``model.parallel_tool_calls`` config value (UNSET -> None).
+
+    Deliberately config-read at request build (not cached): ``hermes config set``
+    must take effect without a restart, and the read is a dict lookup.
+    """
+    try:
+        from hermes_cli.config import read_raw_config
+        model_section = read_raw_config().get("model")
+        if isinstance(model_section, dict) and "parallel_tool_calls" in model_section:
+            return model_section["parallel_tool_calls"]
+    except Exception:
+        return None
+    return None
+
+
 def _route_replays_reasoning_details(base_url: Any) -> bool:
     """True when the target route reads replayed ``reasoning_details`` (OpenRouter's unified
     reasoning array, also consumed by the Nous Portal).
@@ -553,6 +596,14 @@ class ChatCompletionsTransport(ProviderTransport):
         """Build API kwargs from a ProviderProfile — every quirk comes from the profile object."""
         sanitized = _swap_developer_role(profile.prepare_messages(sanitized), (model or "").lower())
         api_kwargs = _base_kwargs(model, sanitized, tools, params, profile=profile)
+
+        # C1: parallel_tool_calls — profile capability-gated, model.parallel_tool_calls
+        # override wins; None omits the key entirely (strict-endpoint safety).
+        _ptc_flag = _parallel_tool_calls_flag(
+            model, profile=profile, model_override=params.get("model_parallel_tool_calls"),
+        )
+        if tools and _ptc_flag is not None:
+            api_kwargs["parallel_tool_calls"] = _ptc_flag
 
         reasoning_config = _reasoning_config_for_model(model, params.get("reasoning_config"))
         # Profiles fronting several backends override get_max_tokens() per model.

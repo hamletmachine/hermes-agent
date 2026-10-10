@@ -184,7 +184,12 @@ def _cli_config_defaults():
     """Built-in defaults for every config key the CLI reads (the file overlays these)."""
     img = "nikolaik/python-nodejs:python3.11-nodejs20"
     return {
-        "model": {"default": "", "base_url": "", "provider": "auto"},
+        "model": {"default": "", "base_url": "", "provider": "auto",
+                  # C1: parallel_tool_calls user override — auto (default) omits the
+                  # request field and trusts the provider default; true/false win over
+                  # the provider profile's capability gate. true on a strict endpoint
+                  # can 400 (unknown top-level field) — that's the user's explicit call.
+                  "parallel_tool_calls": "auto"},
         "terminal": {
             "env_type": "local", "cwd": ".", "home_mode": "auto", "lifetime_seconds": 300,  # cwd "." -> os.getcwd()
             "docker_image": img, "docker_forward_env": [], "singularity_image": f"docker://{img}",
