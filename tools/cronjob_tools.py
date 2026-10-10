@@ -613,6 +613,8 @@ def _action_create(a: Dict[str, Any]) -> str:
             monitor_url=_normalize_optional_job_value(a["monitor_url"]),
             # CLI-only lane: absent from CRONJOB_SCHEMA and the model dispatch (models don't pick models).
             reasoning_effort=a["reasoning_effort"],
+            # CLI-only lane (same rationale): per-job spend cap is user-owned sizing.
+            max_turns=a["max_turns"],
             pinned=bool(a["pinned"]),
             failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])),
             **({"paused": a["paused"], "paused_reason": a["paused_reason"]}
@@ -768,6 +770,11 @@ def _update_core_fields(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[st
     if a["reasoning_effort"] is not None:
         # CLI-only lane; update_job validates, empty string clears the pin.
         updates["reasoning_effort"] = a["reasoning_effort"]
+    if a["max_turns"] is not None:
+        # CLI-only lane (same rationale): per-job spend cap is user-owned sizing.
+        # CLI edit uses 0 = "clear the cap" (matches the --max-turns help); the jobs layer
+        # stores null for unset, so translate 0 -> None here. Positive ints pass through.
+        updates["max_turns"] = None if a["max_turns"] == 0 else a["max_turns"]
     # Re-validate the EFFECTIVE provider/base_url on EVERY update: a job persisted before
     # this guard may hold an unsafe pair, and editing an unrelated field must not leave it
     # schedulable. Merging this update over the stored job lets an operator remediate.
@@ -917,6 +924,7 @@ def cronjob(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    max_turns: Optional[int] = None,
     failure_deliver: Optional[Union[str, List[str]]] = None,
     task_id: str = None,
     session_id: Optional[str] = None,

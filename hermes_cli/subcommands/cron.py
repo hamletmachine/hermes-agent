@@ -77,6 +77,10 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "medium, high, xhigh, max, or ultra. Overrides agent.reasoning_effort "
             "and agent.reasoning_overrides for this job; unsupported levels are "
             "clamped by the provider at request time. Omit to follow config.")
+    cron_create.add_argument("--max-turns", dest="max_turns", type=int, default=None,
+        help="Per-job turn cap: the job is hard-stopped at this many agent turns "
+            "(timed_out outcome). Omit to follow the profile agent.max_turns. "
+            "Positive integer; 0/negatives rejected.")
     cron_create.add_argument(
         "--continuity", dest="continuity", action="store_const", const=True, default=None,
         help="Each run wakes up with the job's own previous output injected "
@@ -144,6 +148,9 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         help="Pin this job's reasoning (thinking) effort: none, minimal, low, "
             "medium, high, xhigh, max, or ultra. Pass empty string to clear "
             "the pin and follow config resolution.")
+    cron_edit.add_argument("--max-turns", dest="max_turns", type=int, default=None,
+        help="Per-job turn cap (timed_out at N turns). Pass 0 to clear the cap "
+            "and follow the profile agent.max_turns.")
 
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")

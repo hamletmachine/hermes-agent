@@ -2051,6 +2051,12 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             # An explicit schedule/lifecycle rewrite supersedes any occurrence the dispatcher
             # left unclaimed — pause/resume/edit must not resurrect a slot from before the edit.
             updated.pop("pending_slot", None)
+        for _opt_key in ("max_turns",):
+            # Optional keys persist only when set (the create-side invariant): an update that
+            # normalizes a value to None (e.g. CLI edit --max-turns 0 clears the cap) must
+            # REMOVE the stored key instead of lingering as dead null bytes.
+            if _opt_key in updates and updated.get(_opt_key) is None:
+                updated.pop(_opt_key, None)
         _fill_missing_next_run(updated)
         _reject_terminal_activation(job, updated, job_id)
         jobs[i] = updated
