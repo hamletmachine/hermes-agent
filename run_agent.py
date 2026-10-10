@@ -1291,7 +1291,7 @@ class AIAgent(
         try:
             session_decision = self._tool_guardrails.session_observe(
                 tool_name, function_args, function_result if isinstance(function_result, str) else None,
-                failed=failed,
+                failed=failed, tool_call_id=tool_call_id,
             )
             if session_decision is not None and session_decision.action == "warn":
                 function_result = append_toolguard_guidance(function_result, session_decision)

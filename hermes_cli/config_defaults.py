@@ -154,6 +154,11 @@ DEFAULT_CONFIG = {
         # api_modes (fixes Gemini/Claude "stops after stating intent"); false = never; or a list of
         # model-name substrings.
         "intent_ack_continuation": "auto",
+        # Silent-streak checkpoint override (R4): the turn FINALIZEs (cron/kanban) or gets a
+        # checkpoint notice after this many consecutive silent iterations. None = computed as
+        # clamp(0.15 x max_iterations, 20, 60). Positive int only; junk falls back to the
+        # computed value.
+        "silent_streak_checkpoint": None,
         # Anti-stall guards: (1) identical-call loop breaker appends a notice when the same tool is
         # called 3+ times with identical args AND results (never blocks; pollers like `process`
         # exempt); (2) continue-intent extension of empty-response recovery re-prompts once when the

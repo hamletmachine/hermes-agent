@@ -1362,6 +1362,20 @@ def _apply_agent_section(agent, _agent_cfg):
     # "auto" (codex_responses only), true (all api_modes), false, or model substrings.
     agent._intent_ack_continuation = _agent_section.get("intent_ack_continuation", "auto")
 
+    # R4 silent-streak checkpoint override (config-reachable per review round 1):
+    # None/absent = computed (clamp(0.15 x max_iterations, 20, 60)); junk ignored.
+    _raw_ssc = _agent_section.get("silent_streak_checkpoint")
+    if isinstance(_raw_ssc, (int, float)) and not isinstance(_raw_ssc, bool) and _raw_ssc > 0:
+        agent.silent_streak_checkpoint = int(_raw_ssc)
+    else:
+        agent.silent_streak_checkpoint = None
+    if _raw_ssc is not None and agent.silent_streak_checkpoint is None:
+        logger.warning(
+            "Invalid agent.silent_streak_checkpoint=%r; expected a positive integer — "
+            "using the computed checkpoint (clamp(0.15 x max_iterations, 20, 60)).",
+            _raw_ssc,
+        )
+
     # Responses `text.verbosity`: "" / unknown value = not sent (never flips the provider default).
     _verbosity = str(_agent_section.get("text_verbosity") or "").strip().lower()
     if _verbosity and _verbosity not in {"low", "medium", "high"}:

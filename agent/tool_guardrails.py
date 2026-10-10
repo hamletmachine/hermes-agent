@@ -403,6 +403,10 @@ class ToolCallGuardrailController:
         # Session-scoped persisted-path pointers (A1): a stub referencing a spillover
         # file must not dangle just because the turn ended.
         self._persisted_result_paths_session: dict[str, str] = {}
+        # signature -> the tool_call_id of the FIRST observed call (review round 1,
+        # defect 2): the session-governor notice/block cites the spillover file for
+        # THIS signature's own first result, never an arbitrary other call's file.
+        self._session_first_call_id: dict[ToolCallSignature, str] = {}
         # Parked block decisions from session_observe: signature -> decision, consumed
         # by the runtime's before-call gate on the NEXT identical call.
         self._session_block_pending: dict[ToolCallSignature, ToolGuardrailDecision] = {}
@@ -637,7 +641,7 @@ class ToolCallGuardrailController:
 
     def session_observe(
         self, tool_name: str, args: Mapping[str, Any] | None, result: Any,
-        *, failed: bool = False,
+        *, failed: bool = False, tool_call_id: str = "",
     ) -> ToolGuardrailDecision:
         """Cross-turn repeat detector: the per-turn detectors are wiped by
         ``reset_for_turn()`` at every turn start, so 83% of red's repeats (multi-hour
@@ -687,6 +691,12 @@ class ToolCallGuardrailController:
         self._session_last_seen[signature] = epoch_now
         if previous_value is None:
             self._session_first_result[signature] = value
+            # First sighting: remember this call's id so the repeat message can cite
+            # the signature's OWN spillover file (review round 1, defect 2). The
+            # spillover is recorded by the runtime right after this observe (the
+            # persist step follows the guardrail observation), and the pointer map
+            # is session-scoped (A1) — so the path resolves across turns.
+            self._session_first_call_id[signature] = tool_call_id or ""
 
         if previous_epoch is None or previous_value != value:
             # First sighting this session, or the result/class changed — no repeat.
@@ -725,14 +735,22 @@ class ToolCallGuardrailController:
             decision = ToolGuardrailDecision(
                 action="block", code="session_repeat_block", tool_name=tool_name, count=count + 1,
                 signature=signature,
-                message=_session_repeat_message(tool_name, count + 1, failed, previous_value, self._persisted_result_paths),
+                message=_session_repeat_message(
+                    tool_name, count + 1, failed, previous_value,
+                    self._persisted_result_paths,
+                    first_call_id=self._session_first_call_id.get(signature, ""),
+                ),
             )
             self._session_block_pending[signature] = decision
             return decision
         if self.config.session_warn_after and count + 1 >= self.config.session_warn_after:
             return self._decide(
                 "warn", "session_repeat_notice", tool_name, count + 1, signature,
-                message=_session_repeat_message(tool_name, count + 1, failed, previous_value, self._persisted_result_paths),
+                message=_session_repeat_message(
+                    tool_name, count + 1, failed, previous_value,
+                    self._persisted_result_paths,
+                    first_call_id=self._session_first_call_id.get(signature, ""),
+                ),
             )
         return allow
 
@@ -932,7 +950,7 @@ _SESSION_PERSISTED_PATH_NOTE = (
 
 def _session_repeat_message(
     tool_name: str, count: int, failed: bool, previous_value: str | None,
-    persisted_paths: Mapping[str, str] | None = None,
+    persisted_paths: Mapping[str, str] | None = None, first_call_id: str = "",
 ) -> str:
     """Session-governor notice/block text. Tiers share one builder: the notice
     points at the earlier result, the block refuses and cites it."""
@@ -949,12 +967,13 @@ def _session_repeat_message(
         text = _SESSION_REPEAT_BLOCK_MESSAGE.format(
             tool_name=tool_name, count=count, result_phrase=result_phrase, change_advice=change_advice,
         )
-        # Point at the persisted spillover when one exists for any observed call
-        # (dangling-reference mitigation, review change 2b): the LAST recorded path
-        # is the best pointer for this signature's repeated reads.
-        if persisted_paths:
-            path = next(iter(persisted_paths.values()))
-            text += _SESSION_PERSISTED_PATH_NOTE.format(path=path)
+        # Point at the persisted spillover for THIS signature's own first result
+        # (dangling-reference mitigation, review change 2b + round-1 defect 2):
+        # keyed by the first observed call's tool_call_id — never an arbitrary
+        # other call's file. Attached only when that call actually spilled.
+        own_path = persisted_paths.get(first_call_id) if (persisted_paths and first_call_id) else None
+        if own_path:
+            text += _SESSION_PERSISTED_PATH_NOTE.format(path=own_path)
     return text
 
 
