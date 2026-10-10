@@ -218,6 +218,59 @@ def test_non_dispatch_gateway_claims_only_its_profile_subscriptions(
     assert len(_unseen_terminal_events_for(foreign_tid, "default-chat")) == 1
 
 
+def test_standalone_lock_holder_wildcard_claims_foreign_profile_rows(
+    tmp_path, monkeypatch,
+):
+    """Forced-trigger for the A5 wake bug: a standalone gateway holding the
+    dispatcher lock adds ``*`` to a notifier_profiles set that ALREADY contains
+    its own profile ('default'). ``_notify_profile_filter`` used to honor the
+    wildcard only when it was the SOLE element (``len(profiles) == 1``), so the
+    SQL fell back to ``notifier_profile IN ('default', '*')`` and rows stamped
+    with a foreign creator profile (e.g. 'purple') were never claimed — cursor
+    frozen at creation, no notify, no wake. The wildcard must win whenever it
+    is present; per-sub destination authorization (route/adapter checks) still
+    rewinds what the gateway cannot deliver.
+    """
+    db_path = tmp_path / "wildcard-mixed-profiles.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        for profile in ("purple", "default"):
+            tid = kb.create_task(conn, title=f"owned by {profile}", assignee="worker")
+            kbn.add_notify_sub(
+                conn,
+                task_id=tid,
+                platform="telegram",
+                chat_id=f"chat-{profile}",
+                notifier_profile=profile,
+            )
+            kb.complete_task(conn, tid, summary=f"{profile} done")
+    finally:
+        conn.close()
+
+    # Mixed set exactly as the standalone lock-holder Collector builds it:
+    # its own active profile + the documented '*' marker. Purple has NO adapter
+    # of its own — the single shared bot serves it (the real deployment: one
+    # Matrix credential for all agents) — so the wildcard is the ONLY path that
+    # can surface the purple-stamped row.
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "default"
+    # Mirror the real standalone runner's non-multiplex adapter resolution:
+    # without multiplex routing any stamped profile delivers through the
+    # primary adapter (authz_mixin fails closed only for multiplex secondaries).
+    runner._authorization_adapter = lambda platform, profile=None: adapter
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    delivered = {item["chat_id"] for item in adapter.sent}
+    assert "chat-purple" in delivered, (
+        "standalone lock-holder with {'default', '*'} must claim foreign-profile rows"
+    )
+    assert "chat-default" in delivered
+
+
 def test_legacy_subscription_requires_confirmed_dispatcher_lock_owner(
     tmp_path, monkeypatch,
 ):
