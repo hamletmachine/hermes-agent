@@ -153,6 +153,27 @@ def _adapter_for_subscription(runner: Any, platform: Any, sub: dict, owner_profi
     adapter = runner._authorization_adapter(platform, owner_profile)
     config = getattr(runner, "config", None)
     if not getattr(config, "multiplex_profiles", False):
+        if adapter is not None:
+            return adapter
+        # Standalone gateway, foreign-profile sub with no dedicated bot. A
+        # profile_routes entry pinning THIS chat to the sub's profile means the
+        # default bot serves that chat AS the profile (route semantics,
+        # bot_profile unset) — deliver through the primary adapter. Without
+        # this, the wildcard claim fix lets the collector list the sub but the
+        # adapter gate silently drops it before claim: completed events
+        # unclaimed forever, no warning below DEBUG (10-10 missed-wake).
+        profile = (owner_profile or getattr(runner, "_kanban_notifier_profile", None)
+                   or runner._active_profile_name())
+        if profile and profile != runner._active_profile_name():
+            metadata = sub.get("delivery_metadata") or {}
+            chat = sub.get("chat_id")
+            for route in getattr(config, "profile_routes", None) or []:
+                if route.enabled and route.platform == getattr(platform, "value", platform) \
+                        and route.profile == profile \
+                        and route.matches(getattr(platform, "value", platform),
+                                          chat_id=chat, thread_id=sub.get("thread_id") or None,
+                                          user_id=sub.get("user_id") or None):
+                    return runner.adapters.get(platform)
         return adapter
     primary = runner.adapters.get(platform)
     if adapter is not None and adapter is not primary:

@@ -853,3 +853,44 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
     assert adapter.handled == [], (
         "notify-only subscriptions must not be woken by a review handoff"
     )
+
+
+def test_standalone_route_pinned_foreign_profile_sub_delivers(tmp_path, monkeypatch):
+    """Standalone (default-profile) gateway + profile_routes pinning a chat to a
+    named profile: a sub stamped with that profile must deliver through the
+    primary bot — the route's own semantics say the default bot serves that
+    chat AS the named profile. Regression for the 10-10 missed-wake: the
+    wildcard claim fix (e308c77b96) let the collector LIST the sub, but
+    _authorization_adapter('red') returned None on the standalone gateway and
+    _adapter_for_subscription returned before the route check, silently
+    dropping every foreign-profile sub forever (completed events unclaimed)."""
+    from gateway.kanban_watchers_notifier import _adapter_for_subscription
+    from gateway.profile_routing import ProfileRoute
+
+    class FakeConfig:
+        multiplex_profiles = False
+        profile_routes = [ProfileRoute(name="red-dm", platform="matrix", profile="red",
+                                       chat_id="!red:matrix.org")]
+
+    class FakeRunner:
+        config = FakeConfig()
+        adapters = {Platform.MATRIX: object()}  # primary bot, default profile
+        _profile_adapters = {}
+        _kanban_notifier_profile = "default"
+        _primary_profile_name = "default"
+
+        def _authorization_adapter(self, platform, profile):
+            return self.adapters.get(platform) if profile in (None, "default") else None
+
+        def _active_profile_name(self):
+            return "default"
+
+    runner = FakeRunner()
+    sub = {"task_id": "t_x", "platform": "matrix", "chat_id": "!red:matrix.org",
+           "thread_id": "", "chat_type": "dm", "notifier_profile": "red",
+           "delivery_metadata": {}}
+    adapter = _adapter_for_subscription(runner, Platform.MATRIX, sub, "red")
+    assert adapter is not None, "route-pinned foreign-profile sub must deliver via primary"
+    # and a sub stamped for a chat pinned to a DIFFERENT profile stays refused:
+    sub2 = {**sub, "chat_id": "!other:matrix.org", "notifier_profile": "purple"}
+    assert _adapter_for_subscription(runner, Platform.MATRIX, sub2, "purple") is None
