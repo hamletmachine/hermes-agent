@@ -78,9 +78,11 @@ const LOCAL_WORDS = {
 export function hostedWay(row: HostedConnectorInput): ConnectorWayHosted {
   const base = {
     accountLabel: row.accountLabel,
+    accounts: row.accounts ?? [],
     connected: row.connected,
     connectedAt: row.connectedAt,
-    disabledTools: row.disabledTools
+    disabledTools: row.disabledTools,
+    retiredAccounts: row.retiredAccounts ?? []
   }
 
   if (row.orgLocked) {
@@ -195,7 +197,7 @@ export function hostedStateWord(way: ConnectorWayHosted): ConnectorStateWord {
   return way.offBy === 'org' ? 'offByYourOrganisation' : HOSTED_WORDS[way.state]
 }
 
-function localWord(way: ConnectorWayLocal): ConnectorStateWord {
+export function localWord(way: ConnectorWayLocal): ConnectorStateWord {
   if (way.reason?.key === 'serverNeedsAuth') {
     return 'serverNeedsAuth'
   }
@@ -252,7 +254,14 @@ export function forgetAbandoned(
 ): HostedConnectorInput[] {
   return rows.map(row =>
     abandoned.has(row.slug) && row.connectionStatus === 'pending'
-      ? { ...row, accountLabel: undefined, connected: false, connectedAt: undefined, connectionStatus: undefined }
+      ? {
+          ...row,
+          accountLabel: undefined,
+          accounts: row.accounts?.filter(account => account.status !== 'pending'),
+          connected: false,
+          connectedAt: undefined,
+          connectionStatus: undefined
+        }
       : row
   )
 }
@@ -326,11 +335,7 @@ function descriptionOf({ bundled, hosted, local }: CardParts): string | undefine
 }
 
 // An install must not rename the app: the bundled entry and the server it becomes read the same way.
-function nameOf(
-  { bundled, hosted, local }: CardParts,
-  titles: Readonly<Record<string, string>>,
-  slug: string
-): string {
+function nameOf({ bundled, hosted, local }: CardParts, titles: Readonly<Record<string, string>>, slug: string): string {
   const key = hosted?.slug ?? local?.connectorSlug ?? bundled?.connectorSlug ?? slug
 
   return titles[key] ?? local?.title ?? connectorTitle(local?.name ?? bundled?.name ?? slug)

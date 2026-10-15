@@ -110,6 +110,8 @@ export function ConnectorRowCard({
 
           {showsCatalogMark(card) ? <CatalogMark /> : null}
 
+          <AccountSummary card={card} />
+
           {twin ? (
             <Badge className="shrink-0" size="xs" variant="muted">
               {twin === 'hostedTwin' ? copy.hostedTwin : copy.alsoLocal}
@@ -155,7 +157,9 @@ function CardLane({
   return (
     <div className="relative z-10 flex w-[7.75rem] shrink-0 flex-col items-end gap-1">
       <span className="flex items-center gap-1.5 text-[0.6875rem] text-(--ui-text-secondary)">
-        {withDot ? <span aria-hidden className={cn('size-[5px] shrink-0 rounded-full', STATE_DOT[card.state])} /> : null}
+        {withDot ? (
+          <span aria-hidden className={cn('size-[5px] shrink-0 rounded-full', STATE_DOT[card.state])} />
+        ) : null}
         <span className="truncate">{stateLabel}</span>
       </span>
 
@@ -185,6 +189,22 @@ function CardLane({
       ) : null}
     </div>
   )
+}
+
+/** The connected account's name, or how many accounts the app has when there are several. */
+function AccountSummary({ card }: { card: ConnectorCardModel }) {
+  const { t } = useI18n()
+  const accounts = card.ways.hosted?.accounts ?? []
+  const summary = accounts.length > 1 ? t.connectorsPage.accounts.count(accounts.length) : accounts[0]?.alias
+
+  return summary ? (
+    <span
+      className="min-w-0 truncate text-[0.6875rem] text-(--ui-text-secondary)"
+      data-slot="connector-account-summary"
+    >
+      {summary}
+    </span>
+  ) : null
 }
 
 function SecondLine({ card, reason }: { card: ConnectorCardModel; reason?: string }) {

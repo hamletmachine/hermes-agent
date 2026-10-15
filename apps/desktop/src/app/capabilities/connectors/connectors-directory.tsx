@@ -13,7 +13,6 @@ import { derivePage, showsAttentionFirst } from './derive-page'
 import { ToolsWash } from './tools-status'
 import type { ConnectorCardModel, ConnectorGroupModel, ConnectorSegmentId, ConnectorsFilter } from './types'
 
-
 export interface ConnectorsDirectoryProps {
   addYourOwn?: ReactNode
   busyKey?: null | string
@@ -58,7 +57,6 @@ export function ConnectorsDirectory({
   const showSegments = segments.length > 2
   const segmentFellBack = segments.length > 0 && segment !== filter.segment
 
-
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-3" data-slot="connectors-directory">
       <div className="flex shrink-0 items-center gap-3">
@@ -71,6 +69,7 @@ export function ConnectorsDirectory({
           <div className="flex shrink-0 items-center gap-3 border-b border-(--ui-stroke-tertiary) pb-1.5">
             <SearchField
               containerClassName="min-w-0 flex-1"
+              inputClassName="flex-1"
               onChange={query => set({ query })}
               placeholder={copy.searchPlaceholder(cards.length)}
               value={filter.query}

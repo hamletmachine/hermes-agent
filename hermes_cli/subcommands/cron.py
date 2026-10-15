@@ -81,6 +81,10 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         help="Per-job turn cap: the job is hard-stopped at this many agent turns "
             "(timed_out outcome). Omit to follow the profile agent.max_turns. "
             "Positive integer; 0/negatives rejected.")
+    cron_create.add_argument("--interpreter",
+        help="Absolute or ~ path to a Python in your own venv (e.g. ~/venvs/report/bin/python) "
+            "for a .py --script / --monitor-script, so it can import packages Hermes does not "
+            "ship. .sh/.bash still run under bash. Omit to use Hermes' Python.")
     cron_create.add_argument(
         "--continuity", dest="continuity", action="store_const", const=True, default=None,
         help="Each run wakes up with the job's own previous output injected "
@@ -151,6 +155,9 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument("--max-turns", dest="max_turns", type=int, default=None,
         help="Per-job turn cap (timed_out at N turns). Pass 0 to clear the cap "
             "and follow the profile agent.max_turns.")
+    cron_edit.add_argument("--interpreter",
+        help="Absolute or ~ path to a Python for a .py script / monitor script. "
+            "Pass empty string to clear (back to Hermes' Python).")
 
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")
