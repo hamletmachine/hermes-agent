@@ -4565,24 +4565,30 @@ def _drain_restart_safe_cron_deliveries(adapters, loop, runner=None) -> None:
         if profile_name is None:
             profile_adapters = adapters
         else:
-            # 2026-10-17 delivery blackout: `_start_one_profile_adapters` setdefaults EVERY served
-            # profile to {} BEFORE any credential check, so a credentialless satellite reads as an
-            # EMPTY map here — falsy-but-not-None — which skipped the SharedRouteAdapters fallback
-            # below and left the drain with an empty adapter map; every satellite Matrix delivery
-            # then failed closed ("platform 'matrix' not configured/enabled"). Treat EMPTY the
-            # same as ABSENT so the route-authorized fallback runs.
-            profile_adapters = getattr(runner, "_profile_adapters", {}).get(profile_name) or None
-        if profile_adapters is None:
-            # Dark-island 2026-09-24: standalone default gateway — satellites have NO entry in
-            # the adapter map (previously: skipped, queues starved). Authorize the satellite's
-            # sends through the primary's live adapters gated by its profile_routes; with no
-            # route for this profile, fail closed (skip) exactly as the upstream loop did.
+            # 2026-10-17 delivery blackout, layer 2 (fix 2 of 2 — commit 1 was 7c4d3ec8a8,
+            # `or None`): a satellite's map can be NON-EMPTY while still lacking the platform it
+            # needs — red carries its own LOCAL console adapter, so `.get('red') or None` kept the
+            # map and the SharedRouteAdapters fallback never armed; every Matrix send still died
+            # fail-closed ("platform 'matrix' not configured/enabled"). Resolve per-PLATFORM
+            # instead of per-MAP: the satellite's own adapters win first (its authority), and
+            # platforms it does not own fall through to the primary's live adapters gated by
+            # exact profile_routes (8ee1648831 / #101113), fail-closed with no route.
+            own_map = getattr(runner, "_profile_adapters", {}).get(profile_name)
             if adapters:
                 routes = _primary_routes_for_profile(profile_name)
-                if routes:
-                    profile_adapters = sched_preflight.SharedRouteAdapters(adapters, routes)
-            if profile_adapters is None:
-                continue
+                shared = (
+                    sched_preflight.SharedRouteAdapters(adapters, routes) if routes else None)
+                if shared is not None:
+                    profile_adapters = sched_preflight.RouteMergedAdapters(
+                        own_map, adapters, routes)
+                else:
+                    profile_adapters = own_map  # own platforms still drain; foreign fail closed
+            else:
+                profile_adapters = own_map
+        if profile_adapters is None:
+            # Dark-island 2026-09-24: standalone default gateway — a satellite with NEITHER own
+            # adapters nor routes delivers nothing (fail closed, never a wrong-room send).
+            continue
         # 2026-10-17 cleanup (post-7c4d3ec8a8): the in-scope rescue that used to live here
         # (`not profile_adapters` → _primary_profile_routes_for_current_home) is unreachable —
         # empty maps now read as ABSENT above and are resolved by the route-authorized fallback

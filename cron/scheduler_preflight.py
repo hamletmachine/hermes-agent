@@ -233,6 +233,33 @@ class SharedRouteAdapters:
         return default
 
 
+class RouteMergedAdapters(SharedRouteAdapters):
+    """A satellite that OWNS some adapters (its local console, its own bots if ever credentialed)
+    and BORROWS the shared primary bot for exactly the platforms its ``profile_routes`` authorize.
+
+    Second layer of the 2026-10-17 delivery fix (after 7c4d3ec8a8): red's per-profile adapter map
+    is NON-EMPTY (it carries the profile's LOCAL console adapter), so treating the map as
+    ``{}-or-None`` never armed the SharedRouteAdapters fallback and the pending-empty-map belief
+    was wrong for profiles with any own adapter. Own wins first (the profile's authority, no route
+    gate); platforms the profile does not own fall through to the route-authorized primary
+    adapter — upstream 0.22.x.
+
+    Subclass (not composition) so ``_resolve_target_transport``'s satellite branch keeps applying
+    the #89302/#103701 rule: the satellite's own (credentialless, default-disabled) platform block
+    may not veto the route-authorized shared transport.
+    """
+
+    def __init__(self, own_adapters, primary_adapters, routes) -> None:
+        super().__init__(primary_adapters, routes)
+        self._own = dict(own_adapters or {})
+
+    def get(self, platform, target=None, default=None):
+        adapter = self._own.get(platform)
+        if adapter is not None:
+            return adapter
+        return super().get(platform, target, default)
+
+
 def _preflight_check_delivery(job: dict) -> Optional[str]:
     """Check delivery targets resolve to configured platforms. ``local``/``origin``/``all`` are
     never checked (no gateway-config load). Unknown platform always blocks; known platform blocks
