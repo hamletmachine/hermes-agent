@@ -60,7 +60,9 @@ def test_multiplex_housekeeping_scopes_primary_and_drains_each_profile(
     tmp_path, monkeypatch
 ):
     root_adapters = {}
-    secondary_adapters = {}
+    # 7c4d3ec8a8: an EMPTY satellite map reads as ABSENT and goes through the route-authorized
+    # fallback instead; this test pins per-profile scoping, so give the satellite live adapters.
+    secondary_adapters = {"slack": object()}
     runner = SimpleNamespace(
         config=SimpleNamespace(multiplex_profiles=True),
         adapters=root_adapters,
@@ -141,8 +143,12 @@ def test_multiplex_housekeeping_uses_primary_routes_for_credentialless_satellite
 
     monkeypatch.setattr(gateway_run, "_profile_runtime_scope", fake_scope)
     monkeypatch.setattr(sched_preflight, "SharedRouteAdapters", FakeSharedRouteAdapters)
-    monkeypatch.setattr(sched_preflight, "_primary_profile_routes_for_current_home",
-        lambda: ["route-to-secondary"],
+    # 7c4d3ec8a8: the credentialless satellite is resolved by the drain's OUTER fallback via
+    # _primary_routes_for_profile (primary-config profile_routes) BEFORE the profile scope —
+    # the old in-scope _primary_profile_routes_for_current_home rescue is gone.
+    monkeypatch.setattr(
+        gateway_run, "_primary_routes_for_profile",
+        lambda name: ["route-to-secondary"] if name == "secondary" else [],
     )
     monkeypatch.setattr(
         scheduler,
@@ -159,6 +165,45 @@ def test_multiplex_housekeeping_uses_primary_routes_for_credentialless_satellite
         ("routed", root_adapters, ["route-to-secondary"]),
         ("drain", routed),
     ]
+
+
+def test_multiplex_housekeeping_skips_credentialless_satellite_without_routes(
+    monkeypatch,
+):
+    """Companion to 7c4d3ec8a8's empty==absent read: a credentialless satellite (empty adapter
+    map) with NO authorizing primary routes fails closed — skipped entirely, never drained with
+    a bare/empty adapter map (the queue stays queued for when adapters or routes appear)."""
+    secondary_home = "/tmp/not-consulted"
+    adapters = {"slack": object()}
+    runner = SimpleNamespace(
+        config=SimpleNamespace(multiplex_profiles=True),
+        adapters=adapters,
+        _profile_adapters={"secondary": {}},
+    )
+    calls = []
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_handoff_watch_scopes",
+        lambda _runner: [(None, None), ("secondary", secondary_home)],
+    )
+
+    @contextmanager
+    def fake_scope(_home):
+        yield
+
+    monkeypatch.setattr(gateway_run, "_profile_runtime_scope", fake_scope)
+    monkeypatch.setattr(gateway_run, "_primary_routes_for_profile", lambda _name: [])
+    monkeypatch.setattr(
+        scheduler,
+        "drain_delivery_queue",
+        lambda live_adapters, _loop: calls.append(("drain", live_adapters)),
+    )
+
+    gateway_run._drain_restart_safe_cron_deliveries(adapters, object(), runner)
+
+    # Only the primary (profile None) drains; the route-less satellite never reaches a drain.
+    assert calls == [("drain", adapters)]
 
 
 def test_primary_drain_delivers_credentialless_satellite_queue_row_through_primary_adapter(

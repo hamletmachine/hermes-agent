@@ -4583,11 +4583,11 @@ def _drain_restart_safe_cron_deliveries(adapters, loop, runner=None) -> None:
                     profile_adapters = sched_preflight.SharedRouteAdapters(adapters, routes)
             if profile_adapters is None:
                 continue
+        # 2026-10-17 cleanup (post-7c4d3ec8a8): the in-scope rescue that used to live here
+        # (`not profile_adapters` → _primary_profile_routes_for_current_home) is unreachable —
+        # empty maps now read as ABSENT above and are resolved by the route-authorized fallback
+        # BEFORE the scope, so `profile_adapters` is always truthy (or the profile was skipped).
         with _profile_runtime_scope(profile_home or get_hermes_home()):
-            if profile_name is not None and not profile_adapters and adapters:
-                routes = sched_preflight._primary_profile_routes_for_current_home()
-                if routes:
-                    profile_adapters = sched_preflight.SharedRouteAdapters(adapters, routes)
             cron_scheduler.drain_delivery_queue(profile_adapters, loop)
 
 
