@@ -4578,13 +4578,20 @@ def _drain_restart_safe_cron_deliveries(adapters, loop, runner=None) -> None:
                 routes = _primary_routes_for_profile(profile_name)
                 shared = (
                     sched_preflight.SharedRouteAdapters(adapters, routes) if routes else None)
-                if shared is not None:
-                    profile_adapters = sched_preflight.RouteMergedAdapters(
-                        own_map, adapters, routes)
+                if own_map:
+                    # 2026-10-17 layer 2 (8521df9de5): a satellite that OWNS some adapters (e.g.
+                    # its local console) must not lose them, and platforms it does not own
+                    # resolve through the primary's live adapters gated by exact profile_routes
+                    # (8ee1648831 / #101113), fail-closed with no route.
+                    profile_adapters = (
+                        sched_preflight.RouteMergedAdapters(
+                            own_map, adapters, routes)
+                        if shared is not None else own_map)
                 else:
-                    profile_adapters = own_map  # own platforms still drain; foreign fail closed
+                    # Credentialless satellite — the 09-24 era path, unchanged bit-for-bit.
+                    profile_adapters = shared
             else:
-                profile_adapters = own_map
+                profile_adapters = own_map or None
         if profile_adapters is None:
             # Dark-island 2026-09-24: standalone default gateway — a satellite with NEITHER own
             # adapters nor routes delivers nothing (fail closed, never a wrong-room send).
