@@ -1570,3 +1570,114 @@ def test_chat_caller_worktree_completion_routes_to_reviewer(monkeypatch, tmp_pat
     assert out.get("status") == "review"
     with kbc.connect() as conn:
         assert kb.get_task(conn, tid).status == "review"
+
+
+def test_review_round_cap_blocks_for_arbitration(monkeypatch, tmp_path):
+    """A reviewer cannot request changes forever; the cap blocks for a human."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    monkeypatch.setattr(kt, "_max_review_rounds", lambda: 1)
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="review loop", assignee="worker")
+        impl = kb.claim_task(conn, tid)
+        assert kb.request_review(conn, tid, summary="v1", reviewer="default",
+                                 expected_run_id=impl.current_run_id) is True
+        review = kb.claim_review_task(conn, tid)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+    first = json.loads(kt._handle_request_changes({"reason": "fix one"}))
+    assert first.get("ok"), first
+    assert first.get("status") == "ready"
+
+    with kbc.connect() as conn:
+        retry = kb.claim_task(conn, tid)
+        assert kb.request_review(conn, tid, summary="v2", reviewer="default",
+                                 expected_run_id=retry.current_run_id) is True
+        review2 = kb.claim_review_task(conn, tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review2.current_run_id))
+    capped = json.loads(kt._handle_request_changes({"reason": "fix two"}))
+    assert capped.get("ok"), capped
+    assert capped.get("status") == "blocked"
+    assert capped.get("block_kind") == "needs_input"
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_kind == "needs_input"
+
+
+def test_missing_default_reviewer_blocks_instead_of_looping(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="missing reviewer", assignee="worker",
+                             workspace_kind="worktree")
+        claimed = kb.claim_task(conn, tid)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+    monkeypatch.setattr(kt, "_default_reviewer", lambda: "ghost")
+    out = json.loads(kt._handle_complete({"summary": "ready"}))
+    assert out.get("ok"), out
+    assert out.get("status") == "blocked"
+    assert out.get("block_kind") == "capability"
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_kind == "capability"
+
+
+def test_unblock_resets_review_round_budget(monkeypatch, tmp_path):
+    """An operator unblock gives the card a fresh review budget, not a lockout."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    monkeypatch.setattr(kt, "_max_review_rounds", lambda: 1)
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="review reset", assignee="worker")
+        impl = kb.claim_task(conn, tid)
+        assert kb.request_review(conn, tid, summary="v1", reviewer="default",
+                                 expected_run_id=impl.current_run_id) is True
+        review = kb.claim_review_task(conn, tid)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+    assert json.loads(kt._handle_request_changes({"reason": "first"})).get("ok")
+    with kbc.connect() as conn:
+        retry = kb.claim_task(conn, tid)
+        assert kb.request_review(conn, tid, summary="v2", reviewer="default",
+                                 expected_run_id=retry.current_run_id) is True
+        review2 = kb.claim_review_task(conn, tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review2.current_run_id))
+    capped = json.loads(kt._handle_request_changes({"reason": "second"}))
+    assert capped.get("status") == "blocked"
+    with kbc.connect() as conn:
+        assert kb.unblock_task(conn, tid) is True
+        again = kb.claim_review_task(conn, tid)
+        assert again is not None
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(again.current_run_id))
+    fresh = json.loads(kt._handle_request_changes({"reason": "third"}))
+    assert fresh.get("ok"), fresh
+    assert fresh.get("status") == "ready"

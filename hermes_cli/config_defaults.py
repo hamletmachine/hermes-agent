@@ -1917,6 +1917,10 @@ DEFAULT_CONFIG = {
         # worker's kanban_complete auto-routes the card into the review lane
         # instead of marking it done; empty disables automatic review.
         "default_reviewer": "",
+        # After this many changes_requested rounds, the next reviewer rejection
+        # blocks the card for human arbitration instead of re-spawning the
+        # implementer forever.
+        "max_review_rounds": 3,
         # Seconds between dispatcher ticks. Lower = snappier pickup; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
         # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,

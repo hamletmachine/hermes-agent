@@ -346,6 +346,17 @@ def _default_reviewer() -> str:
         return ""
 
 
+def _max_review_rounds() -> int:
+    """Reviewer rejections allowed before the card is blocked for arbitration."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+        raw = cfg_get(cfg, "kanban", "max_review_rounds", default=3)
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return 3
+
+
 def _ok_landed(kb, conn, tid: str, default_status: str, **extra: Any) -> str:
     """Success payload reporting where the task actually landed (routing may
     not leave it in the requested status)."""
@@ -778,9 +789,22 @@ def _handle_complete(args: dict, **kw) -> str:
         ):
             from hermes_cli.profiles import profile_exists
             if not profile_exists(default_reviewer):
-                return tool_error(
-                    f"kanban_complete could not route {tid} to the configured "
-                    f"default reviewer {default_reviewer!r}: that profile is not installed.")
+                # A missing reviewer must not leave the card retrying forever:
+                # park it loudly for the operator with the origin notified.
+                ok = kb.block_task(
+                    conn, tid,
+                    reason=(f"automatic review cannot run: default reviewer "
+                            f"{default_reviewer!r} is not installed. Fix "
+                            f"kanban.default_reviewer or review manually."),
+                    kind="capability", expected_run_id=_worker_run_id(tid))
+                if not ok:
+                    return tool_error(
+                        f"kanban_complete could not route {tid} to the configured "
+                        f"default reviewer {default_reviewer!r} (profile not installed) "
+                        f"and could not block the card; inspect it manually.")
+                return _ok_landed(
+                    kb, conn, tid, "blocked", block_kind="capability",
+                    message=f"Blocked: default reviewer {default_reviewer!r} is not installed.")
             try:
                 kb._gate_created_cards(conn, tid, created_cards, summary or result)
             except kb.HallucinatedCardsError as hall_err:
@@ -979,6 +1003,28 @@ def _handle_request_changes(args: dict, **kw) -> str:
     reason = _redact(
         _require_text(args, "reason", "reason is required — describe the changes needed"))
     with _board(args.get("board")) as (kb, conn):
+        # Count only the current review budget: an operator unblock starts a
+        # fresh budget, so a capped card is not permanently locked out.
+        rounds = conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id = ? AND kind = 'changes_requested' "
+            "AND id > COALESCE((SELECT MAX(id) FROM task_events "
+            "WHERE task_id = ? AND kind = 'unblocked'), 0)",
+            (tid, tid),
+        ).fetchone()[0]
+        cap = _max_review_rounds()
+        if int(rounds) >= cap:
+            block_reason = (
+                f"review round cap ({cap}) reached; operator arbitration needed. "
+                f"Last requested change: {reason}"
+            )
+            ok = kb.block_task(
+                conn, tid, reason=block_reason, kind="needs_input",
+                expected_run_id=_worker_run_id(tid))
+            _check(ok, f"could not block {tid} at review cap (rounds={rounds}, cap={cap})")
+            return _ok_landed(
+                kb, conn, tid, "blocked", block_kind="needs_input",
+                review_rounds=int(rounds), max_review_rounds=cap)
         ok, detail = kb.request_changes(
             conn, tid, reason=reason, expected_run_id=_worker_run_id(tid))
         _check(ok, f"could not request changes for {tid}: {detail or 'invalid review state'}")
