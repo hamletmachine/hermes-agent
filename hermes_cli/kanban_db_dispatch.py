@@ -2045,6 +2045,23 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
+def _lane_skills(lane: str, workspace_kind, existing):
+    """Skills the dispatcher force-loads for a claimed card.
+
+    Review-lane workers get `sdlc-review`. Implementation workers get
+    `kanban-worker`; worktree cards (the code-change lane) also get the
+    `requesting-code-review` pre-commit gate so it cannot be forgotten.
+    """
+    skills = list(existing or [])
+    if lane == "review":
+        skills.append("sdlc-review")
+    else:
+        skills.append("kanban-worker")
+        if workspace_kind == "worktree":
+            skills.append("requesting-code-review")
+    return list(dict.fromkeys(skills))
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2139,15 +2156,9 @@ def _dispatch_lane_task(
     if claimed.workspace_kind == "worktree":
         _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
     _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-    if lane == "review":
-        # Force-load sdlc-review; the kanban lifecycle is already in every
-        # worker's system prompt via KANBAN_GUIDANCE.
-        claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
-    else:
-        # Force-load kanban-worker for implementers. The lifecycle prompt is a
-        # summary; the skill carries the handoff/evidence/budget contract. This
-        # removes the "the worker forgot to load it" failure mode.
-        claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "kanban-worker"]))
+    # Force-load the role skills: sdlc-review on the review lane; kanban-worker
+    # for implementers, plus requesting-code-review for worktree (code) cards.
+    claimed.skills = _lane_skills(lane, claimed.workspace_kind, claimed.skills)
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:

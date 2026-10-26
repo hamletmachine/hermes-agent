@@ -1019,3 +1019,22 @@ def test_implementation_dispatch_force_loads_kanban_worker(
 
     assert tid in [task[0] for task in result.spawned]
     assert captured == [["kanban-worker"]]
+
+
+def test_lane_skills_review_lane_gets_sdlc_only():
+    from hermes_cli import kanban_db_dispatch as kbd
+    assert kbd._lane_skills("review", "worktree", ["domain-review"]) == [
+        "domain-review", "sdlc-review",
+    ]
+
+
+def test_lane_skills_worktree_impl_gets_precommit_gate():
+    from hermes_cli import kanban_db_dispatch as kbd
+    assert kbd._lane_skills("implementation", "worktree", None) == [
+        "kanban-worker", "requesting-code-review",
+    ]
+
+
+def test_lane_skills_scratch_impl_stays_lean():
+    from hermes_cli import kanban_db_dispatch as kbd
+    assert kbd._lane_skills("implementation", "scratch", None) == ["kanban-worker"]
