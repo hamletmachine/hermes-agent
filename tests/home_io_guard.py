@@ -11,6 +11,24 @@ import sqlite3
 import sys
 import threading
 
+def _worktree_git_prefixes() -> set:
+    """For a worktree checkout (its ``.git`` is a FILE pointing at ``<main>/.git/worktrees/<name>``):
+    the worktree's own git dir and the common ``.git`` live in the MAIN repo, which may sit under
+    the real Hermes home. Reading that metadata is working on the checkout itself, not against the
+    home — the same nature as the in-checkout ``.git`` allowance below."""
+    pointer = Path(__file__).resolve().parent.parent / ".git"
+    if not pointer.is_file():
+        return set()
+    try:
+        gitdir = Path(pointer.read_text(encoding="utf-8").split("gitdir:", 1)[1].strip()).resolve()
+    except (OSError, IndexError):
+        return set()
+    prefixes = {gitdir}
+    if gitdir.parent.name == "worktrees":  # <main>/.git/worktrees/<name>
+        prefixes.add(gitdir.parent.parent)  # <main>/.git
+    return prefixes
+
+
 _INTERPRETER_PREFIXES = tuple({
     Path(p).resolve() for p in (sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix)
 } | {
@@ -24,7 +42,7 @@ _INTERPRETER_PREFIXES = tuple({
     # checkout's own .venv is not Hermes state; without this every run from a default install
     # trips on its first traceback.
     Path(__file__).resolve().parent.parent,
-})
+} | _worktree_git_prefixes())
 # The same prefixes as plain strings for the check() fast path. PurePath comparison folds case on
 # Windows; ``os.path.normcase`` (identity on POSIX) reproduces that for string compares. Prefixes
 # resolve once at import, as before: they are fixed for the process lifetime.

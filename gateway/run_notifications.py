@@ -1177,7 +1177,13 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         from gateway.wake import WakeNotAccepted
         from tools.process_registry_notifications import should_surface_notification
         if not should_surface_notification(evt):
-            return None  # Suppressed noise is terminal, not a consumed process result.
+            # Suppressed noise is terminal, not a consumed process result. The copy is dropped
+            # here before any claim: hand the offer back so the orphan sweep re-offers the
+            # still-pending durable row (a discard must not wedge it under a stale offer).
+            if evt.get("type") == "async_delegation":
+                from tools.async_delegation import return_completion_offer
+                return_completion_offer(evt)
+            return None
         identity = self._completion_delivery_identity(evt)
         claim = self._CompletionClaim()
         accepted = identity_claimed = refused = False
@@ -1223,6 +1229,14 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             for sibling, claim_id in sibling_claims:
                 if claim_id:
                     self._settle_durable_claim(operation, sibling["delegation_id"], claim_id)
+            if operation in ("release", "defer"):
+                # The claim failed: this runner discarded every settled copy while the durable
+                # row stays pending, so hand the offers back — the orphan sweep re-offers the
+                # row instead of it wedging under a stale in-memory offer.
+                from tools.async_delegation import return_completion_offer
+                return_completion_offer(evt)
+                for sibling, _claim_id in sibling_claims:
+                    return_completion_offer(sibling)
             if accepted and sibling_claims:
                 self._record_coalesced_completion_siblings([event for event, _claim_id in sibling_claims])
 
@@ -1437,6 +1451,11 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 continue
             identity = self._completion_delivery_identity(evt)
             if identity is not None and self._completion_identity_seen(identity):
+                # Dedupe: another copy of this completion was already admitted here. That copy
+                # settled its durable claim on success; on a failed settle the row is still
+                # pending, so hand the offer back instead of wedging it under this discard.
+                from tools.async_delegation import return_completion_offer
+                return_completion_offer(evt)
                 continue
             deliverable.append((evt, synth_text))
         if not deliverable:

@@ -682,6 +682,12 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     owner_execution_id TEXT,
     delivery_claim TEXT,
     delivery_claimed_at REAL,
+    -- Pointer line recorded when a delivery attempt converges to terminal 'dropped'
+    -- (attempt budget, replay age cap, or a preflight terminal target). It cites the row's
+    -- own result_json/task_json (per-task statuses, deliverable and transcript paths), so a
+    -- dropped result stays findable from the ledger alone: a pointer survives, a silent drop
+    -- does not.
+    delivery_pointer TEXT,
     -- Mirrors the delegation tool's own CREATE TABLE (tools/async_delegation.py
     -- _initialize_schema). Keeping the canonical fresh-install shape identical
     -- to the tool's avoids a silent schema drift: the tool's lazy

@@ -123,7 +123,10 @@ def test_orphaned_terminal_completion_is_offered_once_while_the_process_runs(tmp
     assert _row(home, delegation_id)["delivery_state"] == "delivered"
 
 
-def test_row_owned_by_a_live_process_is_never_swept(tmp_path):
+def test_live_owner_row_is_re_offered_after_its_reoffer_gap(tmp_path):
+    """A pending row whose owner is ALIVE gets a periodic re-offer once ``_REOFFER_GAP_S`` passes:
+    a queue drop nobody pops used to wedge it forever (14/14 green rows, owner alive). A live
+    offer still suppresses duplicates — one copy per gap, not a flood."""
     home = tmp_path / "home"
     home.mkdir()
     q = queue.Queue()
@@ -136,8 +139,19 @@ def test_row_owned_by_a_live_process_is_never_swept(tmp_path):
             time.sleep(0.01)
         row = _row(home, handle["delegation_id"])
         assert row["owner_pid"] == os.getpid() and row["delivery_state"] == "pending"
-        assert ad.sweep_orphaned_completions(q, now=row["updated_at"] + 3600) == 0
-    assert q.empty()
+        # Fresh row: the in-process copy is still fresh, the sweep does not re-offer yet.
+        assert ad.sweep_orphaned_completions(q, now=row["updated_at"] + 30) == 0
+        # First staged re-offer at the staleness gate — the rescue no longer skips alive owners
+        # (a queue drop nobody pops used to wedge the row until a restart).
+        assert ad.sweep_orphaned_completions(q, now=row["updated_at"] + 61) == 1
+        (evt,) = _drain(q)
+        assert evt["delegation_id"] == handle["delegation_id"]
+        assert _row(home, handle["delegation_id"])["delivery_state"] == "pending"
+        # One copy at a time: the unreturned offer holds its lease for one gap.
+        assert ad.sweep_orphaned_completions(q, now=row["updated_at"] + 121) == 0
+        ad.return_completion_offer(evt)
+        assert ad.sweep_orphaned_completions(q, now=row["updated_at"] + 181) == 1
+    assert len(_drain(q)) == 1  # the handed-back row's second offer; the first copy was drained above
 
 
 def test_sweep_is_bound_to_the_profile_home_it_runs_under(tmp_path):
@@ -300,7 +314,10 @@ def test_offer_released_after_a_failed_tui_turn_is_re_offered(tmp_path, monkeypa
         server._notif_dispatch_event("sid-owner", owner, evt, "text")
         row = _row(home, delegation_id)
         assert (row["delivery_state"], row["delivery_claim"], row["delivery_attempts"]) == ("pending", None, 1)
-        assert ad.sweep_orphaned_completions(q, now=row["updated_at"] + ad._ORPHAN_STALE_S + 1) == 1
+        # One attempt was spent and settled: the next offer waits the re-offer gap, so the
+        # attempt budget measures failed delivery pipelines, not one live sweep loop (M7).
+        assert ad.sweep_orphaned_completions(q, now=row["updated_at"] + ad._ORPHAN_STALE_S + 1) == 0
+        assert ad.sweep_orphaned_completions(q, now=row["updated_at"] + ad._REOFFER_GAP_S + 1) == 1
     assert [e["delegation_id"] for e in _drain(q)] == [delegation_id]
 
 
