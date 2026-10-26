@@ -52,9 +52,16 @@ async def _submit_claim(client, params, board_db):
         # crash alerts to every inherited notify room (2026-10-26). Acknowledge the
         # owner's resolution — ``resolve_unknown`` commits a captured result when the
         # turn actually finished — then keep polling until the row settles.
-        await client.rpc('prompt.resolve_unknown', session_id=sid,
-                         admission_id=receipt['admission_id'],
-                         generation=receipt.get('execution_generation'))
+        try:
+            await client.rpc('prompt.resolve_unknown', session_id=sid,
+                             admission_id=receipt['admission_id'],
+                             execution_generation=receipt.get('execution_generation'))
+        except GatewayClientError as exc:
+            # Any owner refusal (stale_generation / permission_denied / invalid_params)
+            # is non-fatal: fall through to the poll/worker_result path and let the
+            # dispatcher's retry run on the store as it stands.
+            print(f'kanban: resolve_unknown refused ({exc}); continuing to poll',
+                  file=sys.stderr)
         deadline = time.monotonic() + UNKNOWN_RESOLVE_WAIT_S
         while receipt['status'] != 'terminal' and time.monotonic() < deadline:
             await asyncio.sleep(.2)
