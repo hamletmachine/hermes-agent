@@ -745,6 +745,12 @@ def _handle_complete(args: dict, **kw) -> str:
         # judge by calling kanban_complete before acceptance criteria are met. Only enforce when a judge is
         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
         task = kb.get_task(conn, tid)
+        if task is not None and task.status == "review" and not os.environ.get("HERMES_KANBAN_TASK"):
+            return tool_error(
+                f"kanban_complete refused: {tid} is in the review lane. A review card is "
+                "approved by the reviewer's run, not by a chat/orchestrator caller. "
+                "Use the review lane, or an operator can run "
+                f"`hermes kanban complete --force {tid}` for a manual override.")
         _goal_gate("kanban_complete", task, tid, (summary or result or "").strip())
         try:
             ok = kb.complete_task(

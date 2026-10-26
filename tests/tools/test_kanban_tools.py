@@ -1483,3 +1483,25 @@ class TestDefaultTaskId:
         assert kt._default_task_id("") == worker_env
         assert kt._default_task_id("   ") == worker_env
         assert kt._default_task_id(None) == worker_env
+
+
+def test_chat_caller_cannot_complete_review_card(monkeypatch, tmp_path):
+    """Review approval is the reviewer run's job, not a chat/orchestrator close."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="review approval", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.request_review(conn, tid, summary="ready", reviewer="default") is True
+    out = json.loads(kt._handle_complete({"task_id": tid, "summary": "approved"}))
+    assert "error" in out
+    assert "review lane" in out["error"]
