@@ -336,6 +336,16 @@ def _ok(**fields: Any) -> str:
     return json.dumps({"ok": True, **fields})
 
 
+def _default_reviewer() -> str:
+    """Configured dedicated reviewer for worktree/code cards ('' = disabled)."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+        return str(cfg_get(cfg, "kanban", "default_reviewer", default="") or "").strip()
+    except Exception:
+        return ""
+
+
 def _ok_landed(kb, conn, tid: str, default_status: str, **extra: Any) -> str:
     """Success payload reporting where the task actually landed (routing may
     not leave it in the requested status)."""
@@ -752,6 +762,44 @@ def _handle_complete(args: dict, **kw) -> str:
                 "Use the review lane, or an operator can run "
                 f"`hermes kanban complete --force {tid}` for a manual override.")
         _goal_gate("kanban_complete", task, tid, (summary or result or "").strip())
+        # A worktree card is a code change. When a dedicated reviewer is
+        # configured, a worker's completion is a handoff, not a done: route it
+        # into the review lane automatically so the origin is notified and the
+        # reviewer must approve. The reviewer's own completion (status=review)
+        # skips this branch.
+        default_reviewer = _default_reviewer()
+        if (
+            task is not None
+            and task.status != "review"
+            and task.workspace_kind == "worktree"
+            and default_reviewer
+            and default_reviewer != task.assignee
+            and os.environ.get("HERMES_KANBAN_TASK")
+        ):
+            from hermes_cli.profiles import profile_exists
+            if not profile_exists(default_reviewer):
+                return tool_error(
+                    f"kanban_complete could not route {tid} to the configured "
+                    f"default reviewer {default_reviewer!r}: that profile is not installed.")
+            try:
+                kb._gate_created_cards(conn, tid, created_cards, summary or result)
+            except kb.HallucinatedCardsError as hall_err:
+                return tool_error(
+                    f"kanban_complete blocked: the following created_cards do not exist or were "
+                    f"not created by this worker: {', '.join(hall_err.phantom)}. Retry with "
+                    f"corrected ids or created_cards=[].")
+            ok, reason = kb.request_review(
+                conn, tid, summary=summary or result, metadata=metadata,
+                reviewer=default_reviewer, expected_run_id=_worker_run_id(tid),
+                with_reason=True, require_claim=True, require_reviewer=True,
+            )
+            if not ok:
+                return tool_error(
+                    f"kanban_complete could not hand {tid} to {default_reviewer}: "
+                    f"{reason or 'review transition failed'}")
+            return _ok_landed(
+                kb, conn, tid, "review", reviewer=default_reviewer,
+                message=f"Handed to {default_reviewer} for review; not done until approved.")
         try:
             ok = kb.complete_task(
                 conn, tid, result=result, summary=summary, metadata=metadata,

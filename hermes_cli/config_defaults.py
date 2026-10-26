@@ -1913,6 +1913,10 @@ DEFAULT_CONFIG = {
         # Green to green3, Exsul to default, etc. Empty = fall through to the
         # shared `<root>/kanban/current` pointer.
         "default_board": "",
+        # Dedicated code reviewer for worktree (code) cards. When set, a
+        # worker's kanban_complete auto-routes the card into the review lane
+        # instead of marking it done; empty disables automatic review.
+        "default_reviewer": "",
         # Seconds between dispatcher ticks. Lower = snappier pickup; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
         # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,

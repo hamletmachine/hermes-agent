@@ -1505,3 +1505,44 @@ def test_chat_caller_cannot_complete_review_card(monkeypatch, tmp_path):
     out = json.loads(kt._handle_complete({"task_id": tid, "summary": "approved"}))
     assert "error" in out
     assert "review lane" in out["error"]
+
+
+def _auto_review_task(monkeypatch, tmp_path, workspace_kind):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="auto review", assignee="worker",
+                             workspace_kind=workspace_kind)
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        rid = claimed.current_run_id
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(rid))
+    monkeypatch.setattr(kt, "_default_reviewer", lambda: "default")
+    return kb, kbc, kt, tid
+
+
+def test_worktree_completion_routes_to_default_reviewer(monkeypatch, tmp_path):
+    kb, kbc, kt, tid = _auto_review_task(monkeypatch, tmp_path, "worktree")
+    out = json.loads(kt._handle_complete({"summary": "code change ready"}))
+    assert out.get("ok"), out
+    assert out.get("status") == "review"
+    assert out.get("reviewer") == "default"
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "review"
+
+
+def test_scratch_completion_stays_done(monkeypatch, tmp_path):
+    kb, kbc, kt, tid = _auto_review_task(monkeypatch, tmp_path, "scratch")
+    out = json.loads(kt._handle_complete({"summary": "ops task done"}))
+    assert out.get("ok"), out
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "done"
