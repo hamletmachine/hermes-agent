@@ -2143,6 +2143,11 @@ def _dispatch_lane_task(
         # Force-load sdlc-review; the kanban lifecycle is already in every
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
+    else:
+        # Force-load kanban-worker for implementers. The lifecycle prompt is a
+        # summary; the skill carries the handoff/evidence/budget contract. This
+        # removes the "the worker forgot to load it" failure mode.
+        claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "kanban-worker"]))
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:

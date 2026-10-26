@@ -440,9 +440,17 @@ def current_board_path() -> Path:
 
 
 def get_current_board() -> str:
-    """Active slug: context override -> ``HERMES_KANBAN_BOARD`` -> ``<root>/kanban/current``
-    (only while that board exists) -> ``DEFAULT_BOARD``. A malformed/stale slug
-    falls through — the dispatcher must never crash on a hand-edited file."""
+    """Active slug: context override -> ``HERMES_KANBAN_BOARD`` -> the active
+    profile's ``kanban.default_board`` -> ``<root>/kanban/current`` (only while
+    that board exists) -> ``DEFAULT_BOARD``. A malformed/stale slug falls
+    through — the dispatcher must never crash on a hand-edited file.
+
+    The profile default is what keeps each agent on its own board: the kanban
+    home is shared across profiles by design, so a single ``current`` file cannot
+    express "Red defaults to red7, Exsul to default". Dispatched workers still
+    resolve through ``HERMES_KANBAN_BOARD`` first; this only fills the gap for a
+    profile's chat/CLI sessions.
+    """
     def _existing(candidate: str) -> Optional[str]:
         if not candidate:
             return None
@@ -466,6 +474,18 @@ def get_current_board() -> str:
         found = _existing(candidate)
         if found:
             return found
+    # Per-profile default board (chat/CLI sessions). The kanban home is shared,
+    # so the on-disk `current` file cannot express per-agent defaults. A
+    # dispatched worker's HERMES_KANBAN_BOARD pin already returned above.
+    try:
+        from hermes_cli.config import load_config_readonly
+        _cfg = load_config_readonly() or {}
+        _candidate = str((_cfg.get("kanban") or {}).get("default_board") or "").strip()
+        found = _existing(_candidate)
+        if found:
+            return found
+    except Exception:
+        pass
     try:
         f = current_board_path()
         if f.exists():
@@ -3279,6 +3299,7 @@ def request_review(
     conn: sqlite3.Connection, task_id: str, *, summary: Optional[str] = None,
     metadata: Optional[dict] = None, reviewer: Optional[str] = None,
     expected_run_id: Optional[int] = None, force: bool = False, with_reason: bool = False,
+    require_claim: bool = False, require_reviewer: bool = False,
 ):
     """``running``/``ready`` -> ``review``; never touches block recurrence accounting.
 
@@ -3321,6 +3342,15 @@ def request_review(
             ).fetchone()
             if trow is None:
                 return _ret(False, "task not found")
+            # Agent-facing guard: a card must be claimed by the worker that did
+            # the work. This is what stops the "create the ticket, then fire
+            # request_review" race before the dispatcher can pick it up.
+            if require_claim and not trow["claim_lock"]:
+                return _ret(
+                    False,
+                    "request_review refused: the card is not claimed by a worker; "
+                    "the claiming implementer must request review after doing the work",
+                )
             # Refuse to clear a live worker's claim without proof of ownership
             # (expected_run_id) or an explicit human override (force=True);
             # the same fence as complete_task (_claim_is_live).
@@ -3337,6 +3367,12 @@ def request_review(
                         False, "re-review has no durable reviewer provenance (the "
                         "latest changes_requested event is missing or "
                         "malformed); pass reviewer= explicitly",
+                    )
+                if reviewer is None and require_reviewer:
+                    return _ret(
+                        False,
+                        "reviewer is required on the first review; name the "
+                        "profile that should review this card",
                     )
             reviewer = _canonical_assignee(reviewer)
             # The actor is the run that did the work. ``assignee`` is the actor

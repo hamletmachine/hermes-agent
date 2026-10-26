@@ -928,3 +928,94 @@ def test_synthesized_run_for_unassigned_card_keeps_null_profile(kanban_home: Pat
             "SELECT profile, outcome FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (tid,),
         ).fetchone()
         assert (run["outcome"], run["profile"]) == ("blocked", None)
+
+
+def test_request_review_require_claim_rejects_unclaimed_ready(kanban_home: Path) -> None:
+    """The agent-facing guard stops "create card, immediately request review".
+
+    A ready card with no claim_lock has no implementer run to hand off; allowing
+    it races the dispatcher and produces a review of work nobody did.
+    """
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="unclaimed handoff", assignee="worker")
+        ok, reason = kb.request_review(
+            conn, tid, summary="handoff", reviewer="reviewer",
+            require_claim=True, with_reason=True,
+        )
+        assert ok is False
+        assert reason is not None and "not claimed" in reason
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_request_review_require_reviewer_rejects_first_without_name(kanban_home: Path) -> None:
+    """First review must name its reviewer; re-review can reuse provenance."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="needs reviewer", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        ok, reason = kb.request_review(
+            conn, tid, summary="handoff", expected_run_id=claimed.current_run_id,
+            require_claim=True, require_reviewer=True, with_reason=True,
+        )
+        assert ok is False
+        assert reason is not None and "reviewer is required" in reason
+        assert kb.get_task(conn, tid).status == "running"
+
+        assert kb.request_review(
+            conn, tid, summary="handoff", reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+            require_claim=True, require_reviewer=True,
+        ) is True
+
+
+def test_request_review_require_reviewer_allows_rereview_provenance(kanban_home: Path) -> None:
+    """A re-review may omit reviewer= because changes_requested carries it."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="re-review", assignee="worker")
+        implementation = kb.claim_task(conn, tid)
+        assert implementation is not None
+        assert kb.request_review(
+            conn, tid, summary="v1", reviewer="reviewer",
+            expected_run_id=implementation.current_run_id,
+            require_claim=True, require_reviewer=True,
+        ) is True
+
+        review = kb.claim_review_task(conn, tid)
+        assert review is not None
+        assert kb.request_changes(
+            conn, tid, reason="fix it", expected_run_id=review.current_run_id,
+        ) == (True, "worker")
+
+        retry = kb.claim_task(conn, tid)
+        assert retry is not None
+        assert kb.request_review(
+            conn, tid, summary="v2", expected_run_id=retry.current_run_id,
+            require_claim=True, require_reviewer=True,
+        ) is True
+        assert kb.get_task(conn, tid).status == "review"
+
+
+def test_implementation_dispatch_force_loads_kanban_worker(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An implementation worker gets the worker contract without asking for it."""
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda _name: True)
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *args, **kwargs: {"kanban": {"review_dispatch": True}},
+    )
+    captured: list[list[str]] = []
+
+    def spawn(task, workspace):
+        captured.append(list(task.skills or []))
+
+    monkeypatch.setattr(kbd, "check_respawn_guard", lambda *a, **k: None)
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="implementation", assignee="worker")
+        result = kbd.dispatch_once(conn, spawn_fn=spawn)
+
+    assert tid in [task[0] for task in result.spawned]
+    assert captured == [["kanban-worker"]]
