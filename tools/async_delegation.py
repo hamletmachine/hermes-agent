@@ -460,10 +460,17 @@ def _delivery_pointer(delegation_id: str, row: Optional[tuple], now: float, reas
     Sources are the row's own stored payloads (``result_json``/``event_json``/``task_json``), plus an
     explicit list from the transcript keys the dispatch recorded. POSIX-style tokens only: delegation
     transcripts and deliverables live under POSIX paths here; a Windows worker's payload still carries
-    its paths inside the explicit transcript keys."""
+    its paths inside the explicit transcript keys. A row with neither ``event_json`` nor
+    ``result_json`` records nothing (``None``): there is no stored completion to keep findable
+    (t_5908f939 — NULL, not an all-empty JSON line)."""
     if row is None:
         return None
     event_json, result_json, completed_at, state, task_json, attempts = row
+    if not event_json and not result_json:
+        # Nothing durable anywhere on the row (no completion event, no result): NULL is the
+        # honest line — the JSON form would carry only all-empty lists; the terminal drop
+        # still converges (``_turn_drop_recorded`` logs its '<no durable result>' shape).
+        return None
     event, result, task = _json_object(event_json), _json_object(result_json), _json_object(task_json)
     entries = result.get("results") if isinstance(result.get("results"), list) else []
     statuses = [{"task_index": t.get("task_index"), "status": t["status"]}

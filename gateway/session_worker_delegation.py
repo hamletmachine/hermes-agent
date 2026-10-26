@@ -142,24 +142,52 @@ def _claim(db, conn, session_id, payload, *, execution_id):
     return {'value': changed == 1}
 
 
-_DELIVERY_UPDATES = {
+# Non-terminal delivery receipts. The two terminal outcomes ('drop', and 'release' past
+# the attempt cap) do NOT run through raw fragments: they converge through the local
+# ledger's recorded-drop primitive (tools.async_delegation._turn_drop_recorded), which
+# builds each row's delivery_pointer line from its own event_json/result_json/task_json
+# with the single shared builder and writes it inside the guarded UPDATE — so a
+# worker-side delivery consumer's terminal drop stays findable from the ledger alone
+# (t_3739406f contract clause 3; t_5908f939, these two paths used to drop bare). The
+# reasons are the local leg's call sites' own tokens.
+_DELIVERY_NON_TERMINAL_UPDATES = {
     'ack': "delivery_state='delivered',delivered_at=:now",
-    'drop': "delivery_state='dropped'",
     'defer': 'delivery_attempts=MAX(0,delivery_attempts-1)',
-    'release': "delivery_state=CASE WHEN delivery_attempts>=:cap THEN 'dropped' ELSE delivery_state END",
 }
+_TERMINAL_DELIVERY_REASONS = {'drop': 'session_terminal', 'release': 'attempt_budget_release'}
 
 
 def _delivery(db, conn, session_id, payload, *, execution_id, action):
-    from tools.async_delegation import _MAX_DELIVERY_ATTEMPTS
+    from tools.async_delegation import _MAX_DELIVERY_ATTEMPTS, _turn_drop_recorded
     _shape(payload, {'delegation_id', 'claim_id'})
     _owned(conn, session_id, execution_id, payload['delegation_id'])
     _text(payload['claim_id'])
+    payload = payload | {'now': time.time()}
+    if (reason := _TERMINAL_DELIVERY_REASONS.get(action)) is not None:
+        if action == 'release' and not conn.execute('''SELECT 1 FROM async_delegations
+                   WHERE delegation_id=:delegation_id AND delivery_state='pending'
+                     AND delivery_claim=:claim_id AND delivery_attempts>=:cap''',
+                payload | {'cap': _MAX_DELIVERY_ATTEMPTS}).fetchone():
+            # Not past the attempt budget: hand the claim back. The row stays pending with
+            # its pointer column untouched — the local leg's non-capped release is the
+            # same. Every sibling op that moves delivery_attempts also settles the claim,
+            # so (this transaction owning the row) this UPDATE cannot settle a row the cap
+            # check above did not see.
+            changed = conn.execute('''UPDATE async_delegations SET delivery_claim=NULL,
+                          delivery_claimed_at=NULL, updated_at=:now
+                   WHERE delegation_id=:delegation_id AND delivery_state='pending'
+                     AND delivery_claim=:claim_id''', payload).rowcount
+            return {'value': changed == 1}
+        # drop, or a capped release: the shipped recorded-drop primitive builds the pointer
+        # line from the row's durable payloads and writes it in the same guarded UPDATE
+        # (claim pinned); it also logs the drop for the gateway audit trail.
+        return {'value': _turn_drop_recorded(conn, payload['delegation_id'], payload['now'],
+                                             reason, claim=payload['claim_id'])}
     # Only constant, closed statement fragments enter this query.
-    changed = conn.execute('UPDATE async_delegations SET ' + _DELIVERY_UPDATES[action] +
+    changed = conn.execute('UPDATE async_delegations SET ' +
+        _DELIVERY_NON_TERMINAL_UPDATES[action] +
         ",updated_at=:now,delivery_claim=NULL,delivery_claimed_at=NULL WHERE delegation_id=:delegation_id "
-        "AND delivery_state='pending' AND delivery_claim=:claim_id",
-        payload | {'now': time.time(), 'cap': _MAX_DELIVERY_ATTEMPTS}).rowcount
+        "AND delivery_state='pending' AND delivery_claim=:claim_id", payload).rowcount
     return {'value': changed == 1}
 
 
@@ -182,7 +210,8 @@ def worker_delegation_handlers(execution_id, worker_pid, worker_birth):
         'complete': _complete, 'child': _child, 'read': _read, 'claim': _claim,
         'unscheduled': _unscheduled}.items()}
     handlers['dispatch'] = partial(_dispatch, execution_id=execution_id, worker_pid=worker_pid, worker_birth=worker_birth)
-    handlers.update({name: partial(_delivery, execution_id=execution_id, action=name) for name in _DELIVERY_UPDATES})
+    handlers.update({name: partial(_delivery, execution_id=execution_id, action=name)
+                     for name in (*_DELIVERY_NON_TERMINAL_UPDATES, *_TERMINAL_DELIVERY_REASONS)})
     return {'delegation.' + name: handler for name, handler in handlers.items()}
 
 
