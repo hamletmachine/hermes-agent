@@ -768,13 +768,13 @@ def _handle_complete(args: dict, **kw) -> str:
         # reviewer must approve. The reviewer's own completion (status=review)
         # skips this branch.
         default_reviewer = _default_reviewer()
+        is_worker_completion = bool(os.environ.get("HERMES_KANBAN_TASK"))
         if (
             task is not None
             and task.status != "review"
             and task.workspace_kind == "worktree"
             and default_reviewer
             and default_reviewer != task.assignee
-            and os.environ.get("HERMES_KANBAN_TASK")
         ):
             from hermes_cli.profiles import profile_exists
             if not profile_exists(default_reviewer):
@@ -791,7 +791,8 @@ def _handle_complete(args: dict, **kw) -> str:
             ok, reason = kb.request_review(
                 conn, tid, summary=summary or result, metadata=metadata,
                 reviewer=default_reviewer, expected_run_id=_worker_run_id(tid),
-                with_reason=True, require_claim=True, require_reviewer=True,
+                with_reason=True, require_claim=is_worker_completion,
+                require_reviewer=True,
             )
             if not ok:
                 return tool_error(

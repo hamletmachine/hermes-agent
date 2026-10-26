@@ -1546,3 +1546,27 @@ def test_scratch_completion_stays_done(monkeypatch, tmp_path):
     assert out.get("ok"), out
     with kbc.connect() as conn:
         assert kb.get_task(conn, tid).status == "done"
+
+
+def test_chat_caller_worktree_completion_routes_to_reviewer(monkeypatch, tmp_path):
+    """Even an orchestrator/chat caller cannot mark a worktree card done directly."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="chat-completed code", assignee="worker",
+                             workspace_kind="worktree")
+    monkeypatch.setattr(kt, "_default_reviewer", lambda: "default")
+    out = json.loads(kt._handle_complete({"task_id": tid, "summary": "ready"}))
+    assert out.get("ok"), out
+    assert out.get("status") == "review"
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "review"
