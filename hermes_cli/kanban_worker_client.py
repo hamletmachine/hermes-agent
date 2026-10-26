@@ -18,6 +18,7 @@ import time
 # a failed exit here spends the card's failure budget on an update window. Nothing is submitted
 # until an owner is ready, so waiting can never run the claim twice.
 OWNER_WAIT_S = 180.0
+UNKNOWN_RESOLVE_WAIT_S = 90.0
 _TRANSIENT_OWNER_STATES = frozenset({'draining', 'starting'})
 
 
@@ -46,12 +47,30 @@ async def _submit_claim(client, params, board_db):
         await asyncio.sleep(.2)
         receipt = await client.rpc('prompt.receipt', session_id=sid, admission_id=receipt['admission_id'])
     if receipt['status'] == 'unknown':
-        raise GatewayClientError('Kanban execution unknown; retained by owner')
+        # Epoch rotation (gateway restart / OOM kill) flips started admissions to
+        # ``unknown``; exiting here crashed every claim, wedged the card, and fanned
+        # crash alerts to every inherited notify room (2026-10-26). Acknowledge the
+        # owner's resolution — ``resolve_unknown`` commits a captured result when the
+        # turn actually finished — then keep polling until the row settles.
+        await client.rpc('prompt.resolve_unknown', session_id=sid,
+                         admission_id=receipt['admission_id'],
+                         generation=receipt.get('execution_generation'))
+        deadline = time.monotonic() + UNKNOWN_RESOLVE_WAIT_S
+        while receipt['status'] != 'terminal' and time.monotonic() < deadline:
+            await asyncio.sleep(.2)
+            receipt = await client.rpc('prompt.receipt', session_id=sid,
+                                       admission_id=receipt['admission_id'])
     from gateway.session_kanban import worker_result
     result = worker_result(board_db, params)
     # The attempt's reply ends the log, as a one-shot worker's did: crash diagnostics quote it.
     if result.get('last_output'):
         print(result['last_output'])
+    if receipt['status'] == 'unknown':
+        # Resolved acknowledgement but the row never settled inside the wait: exit
+        # through the honest worker_result path — the dispatcher retry re-claims on a
+        # clean store instead of burning the attempt budget on a poisoned session.
+        print('kanban: admission resolved as unknown without a terminal receipt;'
+              ' dispatcher retry re-claims on a clean store', file=sys.stderr)
     return result.get('exit_code', 1)
 
 
