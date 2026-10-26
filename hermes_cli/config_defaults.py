@@ -1908,6 +1908,11 @@ DEFAULT_CONFIG = {
         # Auto-claim tasks in the review column and spawn the assigned profile with the bundled
         # sdlc-review skill. Disable where every review is done manually from the dashboard.
         "review_dispatch": True,
+        # Per-profile board for chat/CLI sessions when no board= / HERMES_KANBAN_BOARD
+        # is given. The kanban home is shared, so this is how Red defaults to red7,
+        # Green to green3, Exsul to default, etc. Empty = fall through to the
+        # shared `<root>/kanban/current` pointer.
+        "default_board": "",
         # Seconds between dispatcher ticks. Lower = snappier pickup; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
         # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,
