@@ -421,27 +421,37 @@ async def _send_matrix_via_adapter(pconfig, chat_id, message, media_files=None, 
     media_files = media_files or []
     metadata = {"thread_id": thread_id} if thread_id else None
     from gateway.config import Platform
-    _, live_adapter = _live_adapter(Platform.MATRIX, lookup_failed_warning=(
+    runner, live_adapter = _live_adapter(Platform.MATRIX, lookup_failed_warning=(
         "Matrix: live gateway adapter lookup failed; falling back to an "
         "ephemeral connect (may re-init E2EE per send)"))
+    if live_adapter is None and runner is not None:
+        # DARK ISLAND PATCH (2026-10-27): every profile on this box shares ONE Matrix
+        # account/device (the zone homes' .env are symlinks to ~/.hermes/.env), so the
+        # gateway's default-profile adapter IS the correct identity. A secondary profile's
+        # scope (e.g. async-completion delivery under profile 'red') resolves to None
+        # above; reusing the live adapter keeps ONE OlmMachine per device and never spins
+        # a second crypto client. Incident: an ephemeral connect posted an undecryptable
+        # stray into the operator DM at 2026-10-27 22:36:42 (session 801SgDjR6w, zero
+        # share targets) — see matrix-e2ee-recovery skill, 2026-10-27 entry.
+        live_adapter = getattr(runner, "adapters", {}).get(Platform.MATRIX)
     if live_adapter is not None:
         # Owned by the gateway — must NOT be disconnected (return before the ephemeral ``finally``).
         return await _matrix_send_core(live_adapter, chat_id, message, media_files, metadata)
-    try:
-        from plugins.platforms.matrix.adapter import MatrixAdapter
-    except ImportError:
-        return {"error": "Matrix dependencies not installed. Run: "
-                f"{install_hint('matrix')}"}
-    adapter = MatrixAdapter(pconfig)
-    try:
-        if not await adapter.connect():
-            return _error("Matrix connect failed")
-        return await _matrix_send_core(adapter, chat_id, message, media_files, metadata)
-    except Exception as e:
-        return _error(f"Matrix send failed: {e}")
-    finally:
-        with contextlib.suppress(Exception):
-            await adapter.disconnect()
+    # DARK ISLAND PATCH (2026-10-27): NEVER open an ephemeral MatrixAdapter on this box
+    # (operator ban after the 2026-09-27 / 2026-10-15 / 2026-10-27 poison incidents).
+    # A standalone connect is a second OlmMachine on the shared crypto device: it uploads
+    # dead one-time keys, ratchet-desyncs Olm sessions with the operator's clients, and
+    # posts messages nobody can decrypt. Fail closed with an actionable error instead.
+    logger.error(
+        "Matrix: refusing standalone/ephemeral send to %s — no live gateway adapter in "
+        "this process. Standalone Matrix sends re-init E2EE on the shared crypto device "
+        "and poison key state. Run the send inside the gateway, or use a dedicated "
+        "device+store (matrix-e2ee-recovery skill, references/second-crypto-client.md).",
+        chat_id)
+    return _error(
+        "Matrix standalone send disabled on this box (no live gateway adapter available). "
+        "An ephemeral E2EE connect would corrupt the shared crypto device. Send via the "
+        "running gateway, or use a dedicated crypto client with its own device and store.")
 
 
 async def _matrix_send_core(adapter, chat_id, message, media_files, metadata):
