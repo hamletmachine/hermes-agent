@@ -164,11 +164,7 @@ KANBAN_COMPLETE_SCHEMA = _schema(
             ),
         },
     },
-    # SUMMARY IS REQUIRED IN THE MODEL-FACING SCHEMA. The handler also accepts
-    # the legacy `result` field, but leaving this list empty let workers emit
-    # `kanban_complete(board=...)` with neither field; the handler then rejected
-    # it and two workers looped into a protocol violation (2026-10-27).
-    ["summary"],
+    [],
 )
 
 KANBAN_BLOCK_SCHEMA = _schema(
