@@ -149,7 +149,18 @@ def board_notify_target(board: Optional[str] = None) -> Optional[dict[str, Any]]
     them. A board may name its operator destination; the board owner's profile
     stamps the subscription because a foreign profile's stamp silently drops
     delivery on a standalone gateway.
+
+    ``board=None`` resolves through the FULL active-board chain
+    (``get_current_board()``: context override -> ``HERMES_KANBAN_BOARD`` ->
+    per-profile ``kanban.default_board`` -> the ``current`` file), matching
+    where ``create_task`` itself writes. Resolving straight to the ``default``
+    slug here made a CLI/worker card created on a pinned board subscribe
+    nothing (the default board had no ``notify`` block) while the card's own
+    events went to the pinned board.
     """
+    if board is None:
+        from hermes_cli.kanban_db import get_current_board
+        board = get_current_board()
     try:
         from hermes_cli.kanban_db_boards import read_board_metadata
         meta = read_board_metadata(board)
