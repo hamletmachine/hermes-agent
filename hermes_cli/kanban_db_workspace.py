@@ -129,8 +129,15 @@ def _sibling_board_db_files(conn: sqlite3.Connection) -> list[tuple[str, Path]]:
     slug onto the pinned file, so the scan uses the on-disk layout: the
     default board at ``<home>/kanban.db`` and named boards at
     ``<home>/kanban/boards/<slug>/kanban.db``. The slug is a label for
-    operator-facing diagnostics; a directory whose name is not a valid slug is
-    still scanned because its DB can hold tasks.
+    operator-facing diagnostics.
+
+    A directory is a board only when ``board.json`` marks it as one
+    (:func:`hermes_cli.kanban_db_boards._dir_holds_board`): archive and
+    hard-delete both leave the directory without that marker, and a stale
+    ``connect(board=slug)`` used to leave a ``kanban.db``-only stub. Scanning
+    such a stub reads as "unreadable board" and, on the dispatch gate, defers
+    EVERY ready card on EVERY board (review of a771bac2b3:
+    ``boards/_archived/kanban.db`` is a 0-byte file on this box).
     """
     from hermes_cli.kanban_db_connect import _main_db_file  # late: import cycle
 
@@ -140,8 +147,15 @@ def _sibling_board_db_files(conn: sqlite3.Connection) -> list[tuple[str, Path]]:
     root = _kb.boards_root()
     if root.is_dir():
         for child in root.iterdir():
-            if child.is_dir():
-                candidates.append((child.name, child / "kanban.db"))
+            if not child.is_dir():
+                continue
+            if not _kb._dir_holds_board(child):
+                _kb._log.debug(
+                    "kanban board scan: ignoring %s — no board.json (DB-only stub)",
+                    child,
+                )
+                continue
+            candidates.append((child.name, child / "kanban.db"))
     found: list[tuple[str, Path]] = []
     seen: set[Path] = set()
     for slug, path in candidates:
@@ -169,8 +183,27 @@ def _open_board_readonly(db_file: Path):
         other.close()
 
 
+_TASKS_TABLE_SQL = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tasks'"
+
+
+def _board_db_holds_tasks(conn: sqlite3.Connection) -> bool:
+    """False when the database cannot hold a task row, so it holds no claim.
+
+    A file that opens but has no ``tasks`` table is a stub or a board whose
+    schema was never initialized (``create_board`` writes ``board.json``
+    before ``init_db``, and an archived slug's DB is deliberately not
+    recreated). "No table" is proof of zero rows, not an unknown: treating it
+    as unreadable would make one such file defer every ready card on every
+    board forever. A file that is not a SQLite database still raises here —
+    callers keep fail-closed for a real board DB that cannot be read.
+    """
+    return conn.execute(_TASKS_TABLE_SQL).fetchone() is not None
+
+
 def _other_board_uses_path(db_file: Path, task_id: str, key: str) -> bool:
     with _open_board_readonly(db_file) as other:
+        if not _board_db_holds_tasks(other):
+            return False
         return _conn_uses_path(other, task_id, key, exclude_task_id=False)
 
 
@@ -313,6 +346,12 @@ def workspace_claim_holder(
     for slug, db_file in siblings:
         try:
             with _open_board_readonly(db_file) as other:
+                if not _board_db_holds_tasks(other):
+                    _kb._log.debug(
+                        "kanban workspace gate: ignoring %s — no tasks table (stub board)",
+                        db_file,
+                    )
+                    continue
                 found = _claim_in_rows(
                     other.execute(_LIVE_CLAIM_PATHS_ANY_SQL), key, slug
                 )

@@ -499,3 +499,120 @@ def test_sibling_board_enumeration_failure_defers_closed_as_unknown(tmp_path, mo
     assert deferred is not None and deferred.status == "ready"
     assert deferred.consecutive_failures == 0
     assert guard is None, guard
+
+
+def _write_db_only_stub(home: Path, name: str = "_archived") -> Path:
+    """A directory holding a ``kanban.db`` and no ``board.json``.
+
+    Archive and hard-delete both leave a dir without the identity marker; the
+    live box carries ``boards/_archived/kanban.db`` as a 0-byte file.  It is
+    not a board.
+    """
+    stub = home / "kanban" / "boards" / name / "kanban.db"
+    stub.parent.mkdir(parents=True, exist_ok=True)
+    stub.write_bytes(b"")
+    return stub
+
+
+def test_db_only_stub_board_dir_does_not_stop_dispatch(tmp_path, monkeypatch):
+    """A DB-only stub must not defer dispatch; it is not a board.
+
+    Review of a771bac2b3 against the live layout: ``_sibling_board_db_files``
+    enumerated every dir holding a ``kanban.db``, including a 0-byte
+    ``boards/_archived/kanban.db``.  Opening it works, the ``tasks`` query
+    raises ``no such table: tasks``, the scan answers ``unknown`` and the
+    fail-closed branch then defers EVERY ready card on EVERY board — a stop,
+    not a serialization.
+    """
+    home = _isolated_home(tmp_path, monkeypatch)
+    _two_named_boards()
+    _write_db_only_stub(home)
+    free = tmp_path / "free-worktree"
+    free.mkdir()
+    spawn = _Spawn()
+    with kbc.connect(board="beta") as conn_b:
+        card = kb.create_task(
+            conn_b, title="free", assignee="red",
+            workspace_kind="dir", workspace_path=str(free),
+        )
+        res = kbd.dispatch_once(
+            conn_b, spawn_fn=spawn, reconcile_orphans=False, board="beta",
+        )
+    assert card in spawn.ids, (
+        f"stub dir stopped dispatch: unknown={res.skipped_workspace_unknown}"
+    )
+    assert res.skipped_workspace_unknown == []
+
+    # Skipping the stub must not skip REAL boards: a live claim on alpha still
+    # serializes the same checkout on beta.
+    with kbc.connect(board="beta") as conn_b:
+        _release(conn_b, card)
+    shared = tmp_path / "held-worktree"
+    shared.mkdir()
+    with kbc.connect(board="alpha") as conn_a:
+        holder = kb.create_task(
+            conn_a, title="holder", assignee="red",
+            workspace_kind="dir", workspace_path=str(shared),
+        )
+        _hold_claim(conn_a, holder)
+    with kbc.connect(board="beta") as conn_b:
+        waiter = kb.create_task(
+            conn_b, title="waiter", assignee="red",
+            workspace_kind="dir", workspace_path=str(shared),
+        )
+        res2 = kbd.dispatch_once(
+            conn_b, spawn_fn=spawn, reconcile_orphans=False, board="beta",
+        )
+    assert waiter not in spawn.ids
+    assert [tid for tid, _w, _p in res2.skipped_workspace_busy] == [waiter]
+    assert res2.skipped_workspace_busy[0][2] == holder
+
+
+def test_uninitialized_board_db_does_not_stop_dispatch(tmp_path, monkeypatch):
+    """``board.json`` + schema-less ``kanban.db`` proves free, not unknown.
+
+    ``create_board`` writes the metadata before ``init_db`` touches the DB, and
+    an archived slug's DB is deliberately not recreated.  A database with no
+    ``tasks`` table cannot hold a claim, so it is not evidence of a writer.
+    """
+    home = _isolated_home(tmp_path, monkeypatch)
+    _two_named_boards()
+    from hermes_cli.kanban_db_boards import write_board_metadata
+
+    write_board_metadata("gamma")
+    (home / "kanban" / "boards" / "gamma" / "kanban.db").write_bytes(b"")
+    free = tmp_path / "free-worktree"
+    free.mkdir()
+    spawn = _Spawn()
+    with kbc.connect(board="beta") as conn_b:
+        card = kb.create_task(
+            conn_b, title="free", assignee="red",
+            workspace_kind="dir", workspace_path=str(free),
+        )
+        res = kbd.dispatch_once(
+            conn_b, spawn_fn=spawn, reconcile_orphans=False, board="beta",
+        )
+    assert card in spawn.ids, (
+        f"schema-less board stopped dispatch: unknown={res.skipped_workspace_unknown}"
+    )
+    assert res.skipped_workspace_unknown == []
+
+
+def test_cleanup_scan_ignores_db_only_stub_dirs(tmp_path, monkeypatch):
+    """The same enumeration feeds cleanup; a stub must not make it ``unknown``.
+
+    ``_workspace_in_use_by_other`` refuses every rmtree when a sibling DB
+    cannot be read.  A stub dir is not a board, so the path is provably free.
+    """
+    home = _isolated_home(tmp_path, monkeypatch)
+    _two_named_boards()
+    _write_db_only_stub(home)
+    shared = tmp_path / "worktree"
+    shared.mkdir()
+    with kbc.connect(board="beta") as conn:
+        task = kb.create_task(
+            conn, title="cleanup candidate", assignee="red",
+            workspace_kind="dir", workspace_path=str(shared),
+        )
+        verdict = kbw._workspace_in_use_by_other(conn, task, shared)
+    assert verdict is None, f"stub dir made cleanup refuse: {verdict!r}"
