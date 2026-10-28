@@ -110,6 +110,17 @@ def _raw_process_event_session_id(evt: dict) -> str:
     return str(evt.get("origin_session_id") or session_key or "").strip()
 
 
+def _asdi_primary_routes_for(profile_name: str) -> list:
+    """``profile_routes`` authorizing *profile_name*'s chat on the shared primary bot.
+
+    Delegates to gateway.run's loader (kept at arm's length — its import chain reads the
+    primary config through home_io_guard-weighted paths). Tests stub THIS name directly
+    instead of importing gateway.run, so a worktree test run never touches the real home.
+    """
+    from gateway.run import _primary_routes_for_profile
+    return _primary_routes_for_profile(profile_name)
+
+
 def _local_completion_card(evt: dict) -> dict[str, str]:
     """The card of a local process notice: the async-result card the in-process TUI wrote for a
     completion or async delegation (a gateway-side ``/review`` reports as one), and a liveness tick's
@@ -836,8 +847,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         if source is None or not profile_name or profile_name == getattr(self, "_primary_profile_name", None):
             return None
         from cron import scheduler_preflight as sched_preflight
-        from gateway.run import _primary_routes_for_profile
-        routes = _primary_routes_for_profile(profile_name)
+        routes = _asdi_primary_routes_for(profile_name)
         map_fn = getattr(self, "_profile_adapters_map", None)
         own_map = map_fn().get(profile_name) if callable(map_fn) else {}
         primary_map = self._primary_adapters()
@@ -1085,8 +1095,9 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             verdict = await self._classify_completion_target(parent_session_id, str(evt.get("session_key") or ""))
             if verdict != "deliver":
                 # Definitively closed targets still need the normal terminal disposition.
+                # Terminal disposition is normal traffic for replayed rows — DEBUG, not WARNING.
                 if verdict == "terminal":
-                    logger.warning(
+                    logger.debug(
                         "Async-completion delivery gate: terminal target %s — terminal disposition applies.",
                         parent_session_id,
                     )
@@ -1096,16 +1107,17 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         if source is not None:
             platform = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
             adapter = self._resolve_injection_adapter(platform, source)
-            if adapter is None:
-                await _gate_off(f"no injection adapter for platform={platform} profile={getattr(source, 'profile', None)!r}")
         else:
             raw_sid = _raw_process_event_session_id(evt)
             adapter = self.adapters.get(Platform.API_SERVER) if raw_sid else None
+            # The raw api_server lane is NOT a delivery lane (unchanged since the gate existed):
+            # log AND return — the instrumentation commit dropped this return and the gate
+            # flipped closed->open while still logging OFF (review t_cee58630 BLOCKER 1).
             if adapter is not None and adapter_supports_push(adapter):
-                await _gate_off("raw api_server session with push support is not a delivery lane")
+                return await _gate_off("raw api_server session with push support is not a delivery lane")
         if adapter is None:
             if source is not None:
-                return await _gate_off(f"adapter resolved to None (platform={platform})")
+                return await _gate_off(f"no injection adapter for platform={platform} profile={getattr(source, 'profile', None)!r}")
             return await _gate_off("no source and no api_server adapter")
         if not adapter_supports_push(adapter):
             ensure = getattr(adapter, "_ensure_session_db", None)
