@@ -1026,34 +1026,57 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             logger.log(logging.WARNING if kind == "complete" else logging.DEBUG, fail_msg, exc_info=True)
 
     async def _completion_delivery_ready(self, evt: dict) -> bool:
-        """Unavailable owners/transports must not spend a durable delivery attempt."""
+        """Unavailable owners/transports must not spend a durable delivery attempt.
+
+        Every False branch logs here: this gate was a silent killer for satellite
+        async completions (10-28: deleg_4d102669/deleg_efcbb8ca spun pending/0-attempts
+        with zero observable evidence). WARNING on False, debug on the ready path.
+        """
         from gateway.wake import adapter_supports_push
+
+        async def _gate_off(reason: str) -> bool:
+            logger.warning(
+                "Async-completion delivery gate OFF: %s (session_key=%r parent=%s)",
+                reason, evt.get("session_key"), evt.get("parent_session_id"),
+            )
+            return False
 
         parent_session_id = str(evt.get("parent_session_id") or "").strip()
         if parent_session_id:
             verdict = await self._classify_completion_target(parent_session_id, str(evt.get("session_key") or ""))
             if verdict != "deliver":
                 # Definitively closed targets still need the normal terminal disposition.
-                return verdict == "terminal"
+                if verdict == "terminal":
+                    logger.warning(
+                        "Async-completion delivery gate: terminal target %s — terminal disposition applies.",
+                        parent_session_id,
+                    )
+                    return True
+                return await _gate_off(f"classification verdict={verdict!r}")
         source = await asyncio.to_thread(self._build_process_event_source, evt)
         if source is not None:
             platform = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
             adapter = self._resolve_injection_adapter(platform, source)
+            if adapter is None:
+                await _gate_off(f"no injection adapter for platform={platform} profile={getattr(source, 'profile', None)!r}")
         else:
             raw_sid = _raw_process_event_session_id(evt)
             adapter = self.adapters.get(Platform.API_SERVER) if raw_sid else None
             if adapter is not None and adapter_supports_push(adapter):
-                return False
+                await _gate_off("raw api_server session with push support is not a delivery lane")
         if adapter is None:
-            return False
+            if source is not None:
+                return await _gate_off(f"adapter resolved to None (platform={platform})")
+            return await _gate_off("no source and no api_server adapter")
         if not adapter_supports_push(adapter):
             ensure = getattr(adapter, "_ensure_session_db", None)
             try:
                 if not callable(ensure) or await asyncio.to_thread(ensure) is None:
-                    return False
+                    return await _gate_off("adapter lacks push support and has no session db")
             except Exception:
-                logger.debug("Async-completion delivery DB unavailable", exc_info=True)
-                return False
+                logger.warning("Async-completion delivery DB unavailable", exc_info=True)
+                return await _gate_off("adapter push check raised (session db unavailable)")
+        logger.debug("Async-completion delivery gate OPEN (%s)", evt.get("delegation_id"))
         return True
 
     async def _preflight_completion_delivery(self, evt: dict) -> _CompletionClaim:
