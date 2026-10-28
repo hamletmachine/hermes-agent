@@ -84,3 +84,36 @@ def test_no_board_target_keeps_the_old_no_subscription_behaviour(tmp_path, monke
         subs = kbn.list_notify_subs(conn, task_id=tid)
     assert ok is False
     assert subs == []
+
+
+def test_board_none_resolves_through_the_active_board_chain(tmp_path, monkeypatch):
+    """``board=None`` must follow the same resolution as the card's own board.
+
+    Regression: a CLI create with only ``HERMES_KANBAN_BOARD`` pinned wrote the
+    card to the pinned board while ``board_notify_target(None)`` hard-fell to
+    the default slug — the card got NO subscription (the default board had no
+    ``notify`` block). The resolver must honor the active-board chain.
+    """
+    home = _isolated_home(tmp_path, monkeypatch)
+    _board_with_notify("red7")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "red7")
+    assert kbn.board_notify_target(None) is not None
+    assert kbn.board_notify_target(None)["chat_id"] == "!operator:matrix.org"
+
+    # And the end-to-end create path on a pinned board lands a sub row.
+    from hermes_cli.kanban_db_boards import create_board as _cb
+    _cb("alt")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "red7")
+    with kbc.connect(board="red7") as conn:
+        tid = kb.create_task(conn, title="pinned-board card", assignee="red")
+        ok = kbn.auto_subscribe_board(conn, tid, board=None)
+        subs = kbn.list_notify_subs(conn, task_id=tid)
+    assert ok is True
+    assert len(subs) == 1
+    assert subs[0]["chat_id"] == "!operator:matrix.org"
+
+    # A board without a notify block still yields None (no phantom subs).
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "alt")
+    assert kbn.board_notify_target(None) is None
+    assert home.exists()
+
