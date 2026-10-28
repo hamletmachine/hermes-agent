@@ -376,7 +376,9 @@ MEMORY_SCHEMA = {
         "Save durable facts to persistent memory that survive across sessions. Memory is "
         "injected into every future turn, so keep entries compact and high-signal.\n\n"
         "HOW: make ALL your changes to one target in ONE call via an 'operations' array (each "
-        "item: {action, content?, old_text?}). The batch applies atomically and the char limit is "
+        "item: {action, content, old_text}; pass an empty string when the action does not use "
+        "one). content and old_text are schema-required because some thinking models drop "
+        "optional tool arguments. The batch applies atomically and the char limit is "
         "checked only on the FINAL result — so a single call can remove/patch stale entries "
         "to free room AND add new ones, even when an add alone would overflow. The response "
         "reports current/limit chars and confirms completion; one batch call finishes the "
@@ -411,11 +413,11 @@ MEMORY_SCHEMA = {
             },
             "content": {
                 "type": "string",
-                "description": "Required for 'add' and 'patch'. For 'add', the new entry. For 'patch', the text that replaces old_text; the rest of the entry is kept. Alias: 'new_text'."
+                "description": "Schema-required. For 'add' and 'patch', the new entry/text; for 'remove', pass an empty string. For 'patch', the text that replaces old_text; the rest of the entry is kept. Alias: 'new_text'."
             },
             "old_text": {
                 "type": "string",
-                "description": "REQUIRED for 'patch' and 'remove': text from one entry. 'patch' replaces exactly this span (it must occur once in the entry); 'remove' deletes the whole entry. Omit for 'add'."
+                "description": "Schema-required. For 'patch' and 'remove', text from one entry; for 'add', pass an empty string. 'patch' replaces exactly this span (it must occur once in the entry); 'remove' deletes the whole entry."
             },
             "new_text": {
                 "type": "string",
@@ -432,16 +434,21 @@ MEMORY_SCHEMA = {
                     "type": "object",
                     "properties": {
                         "action": {"type": "string", "enum": ["add", "patch", "remove"]},
-                        "content": {"type": "string", "description": "Required for add and patch, as 'content' above."},
+                        "content": {"type": "string", "description": "Schema-required; empty string for remove."},
                         "new_text": {"type": "string", "description": "Alias for 'content' in a batch op."},
-                        "old_text": {"type": "string", "description": "As 'old_text' above."},
+                        "old_text": {"type": "string", "description": "Schema-required; empty string for add."},
                     },
-                    "required": ["action"],
+                    "required": ["action", "content", "old_text"],
                     "additionalProperties": False,
                 },
             },
         },
-        "required": ["target"],
+        # content/old_text are intentionally schema-required even for actions that ignore
+        # one of them: DeepSeek v4.1 Flash's thinking variant drops optional function
+        # arguments (observed 2026-10-28: a patch call arrived as {target, action} only).
+        # Unconditional required is safe; a conditional allOf/if-then is rejected by the
+        # Codex backend. Use an empty string when the action does not use the field.
+        "required": ["target", "content", "old_text"],
     },
 }
 
