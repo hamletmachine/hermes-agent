@@ -1202,13 +1202,15 @@ def _handle_create(args: dict, **kw) -> str:
     _check(assignee, "assignee is required — name the profile that should execute this "
                      "task (the dispatcher will only spawn tasks with an assignee)")
     # Workspace sharing is explicit, with ONE create-time exception owned by the DB:
-    # a creator holding a shared ``dir`` checkout passes that path to a child created
+    # a creator holding a ``dir`` or ``worktree`` checkout passes it to a child created
     # with no workspace (``create_task`` -> ``creator_workspace_inheritance``), because
     # such a child is aimed at the same checkout and must serialize behind the creator
     # instead of spawning into a scratch dir the dispatcher cannot correlate with the
-    # checkout the task body names (2026-10-27 thread-truth). ``worktree``/``scratch``
-    # creators never pass a path down. Project identity is also inherited implicitly
-    # (the DB turns it into a fresh per-task worktree).
+    # checkout the task body names (2026-10-27 thread-truth; a worktree creator also
+    # passes its BRANCH so the child lands on the unmerged work, and cleanup never
+    # deletes a branch it did not create). ``scratch`` creators pass nothing; fan-out
+    # siblings should still name their own workspaces. Project identity is also
+    # inherited implicitly (the DB turns it into a fresh per-task worktree).
     workspace_kind, workspace_path = args.get("workspace_kind"), args.get("workspace_path")
     # See #67567. ``project=""`` is an explicit "no project" (no ``or`` collapse, #106342).
     project_id = args["project"] if "project" in args else args.get("project_id")

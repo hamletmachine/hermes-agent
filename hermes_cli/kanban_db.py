@@ -1222,10 +1222,10 @@ def create_task(
     in the active profile's projects.db — see ``_resolve_project_link``.
     ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
     an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
-    A card created with NO workspace from a creator holding a ``dir`` workspace
-    inherits that ``dir`` path (see ``creator_workspace_inheritance``), so the
-    dispatcher can serialize it against the shared checkout; an explicit
-    ``workspace_kind``/``workspace_path`` always wins.
+    A card created with NO workspace inherits the creator's checkout identity —
+    a ``dir`` path, or a ``worktree`` path AND branch (see
+    ``creator_workspace_inheritance``) — so dispatch serializes it on that
+    checkout and branch; an explicit workspace/branch always wins.
     """
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
     from hermes_cli.kanban_pr_acceptance import validate_contract
@@ -1238,18 +1238,18 @@ def create_task(
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
-    # A card created from a worker that is already inside a shared ``dir``
-    # checkout inherits that workspace when the caller names none: the child is
-    # aimed at the same checkout, and storing the path is what lets dispatch
-    # serialize it behind the creator instead of spawning it into a private
-    # scratch dir the dispatcher cannot correlate with the checkout the task
-    # body names. Explicit ``workspace_kind``/``workspace_path`` always wins.
+    # A child created from a live worker with no workspace named is aimed at
+    # that worker's checkout: inherit its identity so dispatch serializes the
+    # child behind the creator instead of spawning a private scratch dir the
+    # task body never names (see creator_workspace_inheritance).
     workspace_inherited_from: Optional[str] = None
-    if workspace_kind is None and workspace_path is None and creator_task_id:
-        inherited = creator_workspace_inheritance(conn, creator_task_id)
-        if inherited is not None:
-            workspace_kind, workspace_path = inherited
-            workspace_inherited_from = str(creator_task_id)
+    inherited = creator_workspace_inheritance(
+        conn, creator_task_id,
+        workspace_kind=workspace_kind, workspace_path=workspace_path, branch_name=branch_name,
+    )
+    if inherited is not None:
+        workspace_kind, workspace_path, branch_name = inherited
+        workspace_inherited_from = str(creator_task_id)
 
     # A project-scoped board anchors every new task to its project's repo
     # (deterministic worktree + branch) without each surface repeating it.

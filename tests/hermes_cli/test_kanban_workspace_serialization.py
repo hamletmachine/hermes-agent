@@ -1,4 +1,4 @@
-"""One workspace = one writer: creation inherits a shared dir, dispatch serializes it.
+"""One workspace = one writer: creation inherits the creator's checkout, dispatch serializes it.
 
 Regression for the 2026-10-27 thread-truth collision.  RETRACTION of the first
 draft of this docstring: the colliding pair did **not** store the same
@@ -12,20 +12,25 @@ while duplicate FIX card ``t_b4ecddaf`` was created ``scratch`` with
 there (msgs 59563/59588/59607).  A stored-path comparison alone would not
 have deferred it.
 
-Two mechanisms close the class: ``create_task`` inherits a ``dir`` creator's
-path for a card that names no workspace (``workspace_inherited_from`` on the
-``created`` event), and the dispatch gate defers any card whose RESOLVED
-workspace is held by another live claim.  A held card stays in its lane with a
-recorded reason and spawns after release; it is never a failure.
+Three mechanisms close the class: ``create_task`` inherits the creator's
+checkout for a card that names no workspace (``dir`` path, or a ``worktree``
+path AND branch — path-only would resolve to a fresh worktree at HEAD and
+silently drop the creator's unmerged branch); the dispatch gate defers any card
+whose RESOLVED workspace is held by another live claim; and worktree cleanup
+deletes only the branch git created for the finishing task (``wt/<task-id>``),
+never a branch it inherited.  A held card stays in its lane with a recorded
+reason and spawns after release; it is never a failure.
 """
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_workspace as kbw
 
 
 def _isolated_home(tmp_path, monkeypatch):
@@ -301,24 +306,158 @@ def test_explicit_child_workspace_wins_over_creator_dir(tmp_path, monkeypatch):
     assert out_row is not None and (out_row.workspace_kind, out_row.workspace_path) == ("scratch", None)
 
 
-def test_worktree_creator_does_not_pass_its_checkout_down(tmp_path, monkeypatch):
-    """A worktree is per-task: a child must not inherit another task's checkout.
+def _git(*args: str) -> None:
+    result = subprocess.run(
+        ["git", *args], capture_output=True, text=True, timeout=120, check=False,
+    )
+    assert result.returncode == 0, f"git {' '.join(args)} failed: {result.stderr}"
 
-    Sharing one would put two tasks on the first task's branch (the same rule
-    ``_insert_decomposed_child`` and ``_resolve_worktree_workspace`` enforce).
+
+def _project_repo(tmp_path: Path) -> Path:
+    """A repo with a pushed initial commit, so worktree cleanup predicates work."""
+    origin = tmp_path / "origin.git"
+    _git("init", "--bare", str(origin))
+    project = tmp_path / "project"
+    _git("clone", str(origin), str(project))
+    _git("-C", str(project), "config", "user.email", "t@example.com")
+    _git("-C", str(project), "config", "user.name", "t")
+    (project / "README.md").write_text("hello\n", encoding="utf-8")
+    _git("-C", str(project), "add", "README.md")
+    _git("-C", str(project), "commit", "-m", "init")
+    _git("-C", str(project), "push", "origin", "HEAD")
+    return project
+
+
+def test_child_created_without_workspace_inherits_creator_worktree_and_defers(
+    tmp_path, monkeypatch
+):
+    """A worktree creator's no-workspace child runs in that checkout, on that branch.
+
+    Path-only inheritance is not enough: ``_resolve_worktree_workspace`` reuses
+    an existing checkout only when its current branch equals the task's
+    ``branch_name``, so a child on the default ``wt/<child>`` branch would get a
+    NEW worktree at HEAD — not the creator's unmerged branch. The child must
+    therefore inherit the branch too, and the gate must serialize it behind the
+    creator's live claim.  Before branch-aware inheritance the child resolves
+    ``('scratch', None)`` and spawns into its own scratch dir, which is the
+    incident class this test pins.
     """
     _isolated_home(tmp_path, monkeypatch)
-    checkout = tmp_path / "repo" / ".worktrees" / "t_creator"
-    checkout.mkdir(parents=True)
+    project = _project_repo(tmp_path)
+    spawn = _Spawn()
+    with kbc.connect() as conn:
+        # The creator row as dispatch leaves it: canonical worktree path + branch.
+        creator = kb.create_task(
+            conn, title="worktree creator", assignee="red",
+            workspace_kind="worktree", workspace_path=str(project),
+        )
+        checkout = project / ".worktrees" / creator
+        kbw._ensure_git_worktree(project, checkout, f"wt/{creator}")
+        kbw.set_workspace_path(conn, creator, str(checkout))
+        kbw.set_branch_name(conn, creator, f"wt/{creator}")
+        child = kb.create_task(
+            conn, title="fix on the creator's branch", assignee="red",
+            creator_task_id=creator,
+            body=f"edit files under {checkout} and commit to the checked-out branch",
+        )
+        row = kb.get_task(conn, child)
+        created = [e for e in kb.list_events(conn, child) if e.kind == "created"]
+        _hold_claim(conn, creator)
+        res = kbd.dispatch_once(conn, spawn_fn=spawn, reconcile_orphans=False)
+        deferred = kb.get_task(conn, child)
+    assert row is not None
+    assert (row.workspace_kind, row.workspace_path, row.branch_name) == (
+        "worktree", str(checkout), f"wt/{creator}",
+    ), "child did not inherit the creator's worktree identity"
+    assert created and (created[0].payload or {}).get("workspace_inherited_from") == creator
+    # The row's branch_name is inherited too (asserted above); the created event
+    # records it alongside workspace_inherited_from.
+    assert (created[0].payload or {}).get("branch_name") == f"wt/{creator}"
+    assert child not in spawn.ids, f"spawned beside the creator: {spawn.calls}"
+    assert [tid for tid, _w, _p in res.skipped_workspace_busy] == [child]
+    assert res.skipped_workspace_busy[0][2] == creator
+    assert deferred is not None and deferred.status == "ready"
+    assert deferred.claim_lock is None and deferred.consecutive_failures == 0
+
+    # Control: the same fixture spawns the child into that checkout after release,
+    # so the deferral above is the live claim, not the fixture.
+    with kbc.connect() as conn:
+        _release(conn, creator)
+        res2 = kbd.dispatch_once(conn, spawn_fn=spawn, reconcile_orphans=False)
+    assert [tid for tid, _w, _p in res2.spawned] == [child]
+    assert spawn.calls == [(child, str(checkout))]
+
+
+def test_worktree_creator_without_a_stored_branch_gets_the_canonical_one(
+    tmp_path, monkeypatch
+):
+    """A legacy/unresolved creator row (no branch yet) still yields a usable identity.
+
+    Dispatch stores ``wt/<task-id>`` for a worktree card it spawns, so that is
+    the branch a child of such a row must carry — otherwise the child would
+    default to ``wt/<child>`` and miss the creator's branch entirely. The child
+    must also still resolve to the creator's existing checkout.
+    """
+    _isolated_home(tmp_path, monkeypatch)
+    project = _project_repo(tmp_path)
+    spawn = _Spawn()
     with kbc.connect() as conn:
         creator = kb.create_task(
             conn, title="worktree creator", assignee="red",
-            workspace_kind="worktree", workspace_path=str(checkout),
+            workspace_kind="worktree", workspace_path=str(project),
+        )
+        checkout = project / ".worktrees" / creator
+        kbw._ensure_git_worktree(project, checkout, f"wt/{creator}")
+        # No branch stored on the row: the fallback must name the branch git
+        # actually checked out there, or the child materializes its own worktree.
+        kbw.set_workspace_path(conn, creator, str(checkout))
+        child = kb.create_task(conn, title="child", assignee="red", creator_task_id=creator)
+        row = kb.get_task(conn, child)
+        # The creator has finished; only the child is in the ready lane.
+        _release(conn, creator)
+        res = kbd.dispatch_once(conn, spawn_fn=spawn, reconcile_orphans=False)
+    assert row is not None
+    assert (row.workspace_kind, row.workspace_path, row.branch_name) == (
+        "worktree", str(checkout), f"wt/{creator}",
+    )
+    assert [tid for tid, _w, _p in res.spawned] == [child]
+    assert spawn.calls == [(child, str(checkout))]
+
+
+def test_explicit_workspace_wins_over_creator_worktree(tmp_path, monkeypatch):
+    """An explicit workspace still wins: a fan-out child is not forced onto the parent."""
+    _isolated_home(tmp_path, monkeypatch)
+    project = _project_repo(tmp_path)
+    with kbc.connect() as conn:
+        creator = kb.create_task(
+            conn, title="worktree creator", assignee="red",
+            workspace_kind="worktree", workspace_path=str(project),
+        )
+        checkout = project / ".worktrees" / creator
+        kbw._ensure_git_worktree(project, checkout, f"wt/{creator}")
+        kbw.set_workspace_path(conn, creator, str(checkout))
+        kbw.set_branch_name(conn, creator, f"wt/{creator}")
+        own = kb.create_task(
+            conn, title="independent work", assignee="red", creator_task_id=creator,
+            workspace_kind="scratch",
+        )
+        own_row = kb.get_task(conn, own)
+    assert own_row is not None
+    assert (own_row.workspace_kind, own_row.workspace_path) == ("scratch", None)
+
+
+def test_scratch_creator_does_not_pass_its_workspace_down(tmp_path, monkeypatch):
+    """Scratch is ephemeral per-task storage: never inherited, even with a path."""
+    _isolated_home(tmp_path, monkeypatch)
+    with kbc.connect() as conn:
+        creator = kb.create_task(
+            conn, title="scratch creator", assignee="red",
+            workspace_kind="scratch", workspace_path=str(tmp_path / "own-scratch"),
         )
         child = kb.create_task(conn, title="child", assignee="red", creator_task_id=creator)
         row = kb.get_task(conn, child)
     assert row is not None
-    assert (row.workspace_kind, row.workspace_path) == ("scratch", None)
+    assert (row.workspace_kind, row.workspace_path, row.branch_name) == ("scratch", None, None)
 
 
 def test_busy_deferral_records_one_event_across_ticks(tmp_path, monkeypatch):

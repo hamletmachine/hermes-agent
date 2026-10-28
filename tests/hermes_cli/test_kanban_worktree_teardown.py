@@ -179,8 +179,31 @@ def test_custom_branch_survives_worktree_removal(repo: Path) -> None:
     wt = _make_worktree(repo, "t_dddd4444", branch="feature/custom")
     kbw._cleanup_worktree_workspace("t_dddd4444", str(wt), "feature/custom")
     assert not wt.exists()
-    # only auto-generated wt/* branches are deleted
+    # only auto-generated wt/<task-id> branches are deleted
     assert _branch_exists(repo, "feature/custom")
+
+
+def test_inherited_creator_branch_survives_child_cleanup(repo: Path) -> None:
+    """A child that ran in its creator's checkout must not delete the creator's branch.
+
+    Branch-aware inheritance records the creator's ``wt/<creator-id>`` branch on
+    the child row. When the child finishes it may reap the shared worktree, but
+    the branch holds the creator's (reviewed, possibly unmerged) commits and is
+    not the child's to delete. The old ``startswith("wt/")`` rule deleted it.
+    """
+    owner, child = "t_owner77", "t_child77"
+    wt = _make_worktree(repo, owner)
+    kbw._cleanup_worktree_workspace(child, str(wt), f"wt/{owner}")
+    assert not wt.exists()
+    assert _branch_exists(repo, f"wt/{owner}")
+
+
+def test_custom_wt_prefixed_branch_is_not_owned(repo: Path) -> None:
+    """Ownership is the exact ``wt/<task-id>`` name, not the ``wt/`` prefix."""
+    wt = _make_worktree(repo, "t_custom88", branch="wt/custom-feature")
+    kbw._cleanup_worktree_workspace("t_custom88", str(wt), "wt/custom-feature")
+    assert not wt.exists()
+    assert _branch_exists(repo, "wt/custom-feature")
 
 
 def test_main_checkout_never_removed(repo: Path) -> None:

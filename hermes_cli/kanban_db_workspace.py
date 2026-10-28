@@ -259,38 +259,66 @@ def workspace_claim_holder(
 
 
 def creator_workspace_inheritance(
-    conn: sqlite3.Connection, creator_task_id: Optional[str]
-) -> Optional[tuple[str, str]]:
-    """``(workspace_kind, workspace_path)`` a new card inherits from its creator.
+    conn: sqlite3.Connection,
+    creator_task_id: Optional[str],
+    *,
+    workspace_kind: Optional[str] = None,
+    workspace_path: Optional[str] = None,
+    branch_name: Optional[str] = None,
+) -> Optional[tuple[str, str, Optional[str]]]:
+    """``(workspace_kind, workspace_path, branch_name)`` a new card inherits.
 
-    Only a ``dir`` creator passes its path down. A ``dir`` workspace names an
-    existing, externally-owned checkout that the creating worker is already in,
-    so a card created from there is aimed at that same checkout; storing the
-    path is what lets :func:`workspace_claim_holder` serialize the child behind
-    the creator instead of spawning it into a private scratch dir the
-    dispatcher cannot correlate with the checkout the task body names
-    (2026-10-27 thread-truth: duplicate FIX card ``t_b4ecddaf`` was created
-    ``scratch``/NULL from review card ``t_7fb5b97c`` — ``dir`` = thread-truth —
+    ``None`` when the caller named any workspace/branch field: explicit input
+    always wins over inheritance.
+
+    A card created from a running worker with no workspace named is aimed at
+    the checkout that worker is in, so the child stores that checkout's identity
+    and the dispatcher can correlate it instead of spawning the child into a
+    private scratch dir the task body does not name. The class is the 2026-10-27
+    thread-truth collision: duplicate FIX card ``t_b4ecddaf`` was created
+    ``scratch``/NULL from review card ``t_7fb5b97c`` (``dir`` = thread-truth),
     spawned into its own scratch dir, and its worker ``cd``-ed into the shared
-    checkout from the task instructions, colliding with ``t_2fd4a827`` run 210).
+    checkout from the task instructions, colliding with ``t_2fd4a827`` run 210.
 
-    ``worktree`` creators do NOT pass a path down: a worktree is per-task, and
-    both :func:`_resolve_worktree_workspace` and ``_insert_decomposed_child``
-    refuse to share one checkout across tasks (a sibling would land on the first
-    task's branch). ``scratch`` is ephemeral per-task storage by design. Returns
-    ``None`` when there is nothing safe to inherit.
+    ``dir``: the path is the identity (externally-owned checkout, never cleaned
+    up by kanban); the branch is irrelevant because route resolution for a
+    ``dir`` card returns the path verbatim.
+
+    ``worktree``: a checkout is per-task, so the path is NOT enough — path-only
+    inheritance would let :func:`_resolve_worktree_workspace` see a checkout of
+    a DIFFERENT branch than the child's and materialize a fresh worktree at
+    HEAD, silently dropping the creator's unmerged branch. The child therefore
+    inherits the creator's ``branch_name`` too (falling back to the canonical
+    ``wt/<creator-id>`` a dispatched creator's row stores). Reusing the checkout
+    is safe because the dispatch gate serializes every task whose RESOLVED
+    workspace path matches a live claim: the child waits for the creator's
+    release. Cleanup protects the borrowed branch: a task only deletes the
+    branch git created for it (``wt/<task-id>``), never an inherited one.
+
+    ``scratch`` is ephemeral per-task storage by design. A ``worktree`` creator
+    with no stored path has never been dispatched, so there is no checkout to
+    point at. ``creator_task_id`` is only supplied by a live creator worker
+    (``HERMES_KANBAN_TASK`` / dispatcher-owned context), and dispatch stores the
+    resolved path+branch before spawning it, which is what makes this pair
+    authoritative. Returns ``None`` when there is nothing safe to inherit.
     """
     if not creator_task_id:
         return None
+    if workspace_kind is not None or workspace_path is not None or branch_name is not None:
+        return None
     row = conn.execute(
-        "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+        "SELECT workspace_kind, workspace_path, branch_name FROM tasks WHERE id = ?",
         (str(creator_task_id),),
     ).fetchone()
     if row is None or not row["workspace_path"]:
         return None
-    if (row["workspace_kind"] or "scratch") != "dir":
-        return None
-    return "dir", row["workspace_path"]
+    kind = row["workspace_kind"] or "scratch"
+    if kind == "dir":
+        return "dir", row["workspace_path"], None
+    if kind == "worktree":
+        branch = (row["branch_name"] or "").strip() or f"wt/{creator_task_id}"
+        return "worktree", row["workspace_path"], branch
+    return None
 
 
 def _defer_shared_workspace_cleanup(
@@ -516,8 +544,10 @@ def _cleanup_worktree_workspace(
     Mirrors the CLI startup pruner (``cli._prune_stale_worktrees``): removal
     requires a clean tree AND every commit reachable from a remote-tracking
     ref; any doubt (dirty, unpushed, unresolvable repo, failing git) preserves
-    it. The auto-generated ``wt/<task-id>`` branch is deleted with it; custom
-    branches are kept. Best-effort."""
+    it. ONLY the auto-generated ``wt/<task-id>`` branch is deleted with it: a
+    ``wt/*`` branch inherited from the creator (a child that ran in the
+    creator's checkout on the creator's branch) and any custom branch are other
+    tasks' work and are kept. Best-effort."""
     try:
         from hermes_cli.worktree_ops import _worktree_has_unpushed_commits, _worktree_is_dirty
     except Exception:
@@ -575,8 +605,14 @@ def _cleanup_worktree_workspace(
             )
             return
         _kb._log.debug("Removed worktree workspace: %s", wp)
+        # Ownership: delete ONLY the branch git created for THIS task
+        # (``wt/<task-id>``). A ``wt/*`` branch inherited from the creator —
+        # a child ran in the creator's checkout on the creator's branch — and
+        # any custom branch belong to another task's work; deleting them here
+        # would destroy reviewed, possibly unmerged commits when the child
+        # finishes after (or before) the branch's owner.
         branch = (branch_name or "").strip() or f"wt/{task_id}"
-        if branch.startswith("wt/"):
+        if branch == f"wt/{task_id}":
             _git(repo_root, "branch", "-D", branch, timeout=30)
     except Exception:
         pass  # best-effort — never block completion
