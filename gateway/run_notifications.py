@@ -814,14 +814,53 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 return self.adapters.get(Platform.RELAY)
         # One resolver with authz/kanban/cron: a secondary's own map, or the primary's for a
         # shared-bot satellite; a disconnected secondary fails closed to ``{}``.
-        adapters = self._adapters_for_profile(getattr(source, "profile", None))
+        profile_name = getattr(source, "profile", None)
+        adapters = self._adapters_for_profile(profile_name)
         try:
             _transport = resolve_delivery_transport(Platform(platform_name), self.config, adapters)
         except Exception:
             _transport = None
         if _transport is not None:
             return _transport.adapter
-        return next((a for p, a in adapters.items() if p.value == platform_name), None)
+        own = next((a for p, a in adapters.items() if p.value == platform_name), None)
+        if own is not None:
+            return own
+        # 2026-10-28 (mirror of gateway/run.py:4530-4548 — 7c4d3ec8a8 + 8521df9de5/74cd0c177c):
+        # a shared-bot satellite's own map can be NON-EMPTY while still lacking THIS platform
+        # (black carries profile-local adapters but shares the primary's matrix bot through
+        # ``profile_routes`` — one credential, by operator design). The completion-injection
+        # path must resolve per-PLATFORM like the cron delivery path does: own adapters win
+        # first, then the route-authorized shared bot for the target chat, failing CLOSED when
+        # no route authorizes it (never the wrong room). Reuses the reviewed
+        # SharedRouteAdapters/RouteMergedAdapters pair verbatim.
+        if source is None or not profile_name or profile_name == getattr(self, "_primary_profile_name", None):
+            return None
+        from cron import scheduler_preflight as sched_preflight
+        from gateway.run import _primary_routes_for_profile
+        routes = _primary_routes_for_profile(profile_name)
+        map_fn = getattr(self, "_profile_adapters_map", None)
+        own_map = map_fn().get(profile_name) if callable(map_fn) else {}
+        primary_map = self._primary_adapters()
+        if not routes or primary_map.get(Platform(platform_name)) is None:
+            logger.warning(
+                "Async-completion injection fallback: profile=%r platform=%s — no route / no %s adapter on the shared bot (fail closed)",
+                profile_name, platform_name, platform_name,
+            )
+            return None
+        target = {
+            "chat_id": getattr(source, "chat_id", None),
+            "thread_id": getattr(source, "thread_id", None),
+        }
+        adapter = (
+            sched_preflight.RouteMergedAdapters(own_map or {}, primary_map, routes)
+            if own_map else sched_preflight.SharedRouteAdapters(primary_map, routes)
+        ).get(Platform(platform_name), target)
+        logger.warning(
+            "Async-completion injection fallback: profile=%r platform=%s target=%r -> %s",
+            profile_name, platform_name, target,
+            "route-authorized shared adapter" if adapter is not None else "no content match (fail closed)",
+        )
+        return adapter
 
     async def _inject_watch_notification(
         self, synth_text: str, evt: dict, *, raise_not_accepted: bool = False,
