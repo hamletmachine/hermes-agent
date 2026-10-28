@@ -207,6 +207,57 @@ def _workspace_in_use_by_other(
     return None
 
 
+# ---------------------------------------------------------------------------
+# Dispatch serialization: one workspace = one writer
+# ---------------------------------------------------------------------------
+
+# A ``running`` row that still carries a claim is a live writer for this tick:
+# the dispatcher's reclaim phase (stale/crashed/orphaned) runs BEFORE any claim,
+# so a claim that outlived its worker was already released by then.
+_LIVE_CLAIM_PATHS_SQL = (
+    "SELECT id, workspace_path FROM tasks "
+    "WHERE id != ? AND status = 'running' AND claim_lock IS NOT NULL "
+    "AND workspace_path IS NOT NULL"
+)
+
+
+def workspace_identity(path: Path | str | None) -> Optional[str]:
+    """Resolved identity for a workspace path: symlinks, ``..`` and unicode form.
+
+    Every dispatch-time workspace comparison goes through this — a row may store
+    ``~``, a symlinked spelling, or a decomposed unicode string, and the worker's
+    ``cwd`` is the resolved target. Returns ``None`` when the path cannot be
+    resolved (never treated as a match).
+    """
+    if path is None:
+        return None
+    try:
+        resolved = Path(path).expanduser().resolve(strict=False)
+    except OSError:
+        return None
+    return _path_key(resolved)
+
+
+def workspace_claim_holder(
+    conn: sqlite3.Connection, task_id: str, path: Path | str
+) -> Optional[str]:
+    """Task id of a live claimed run whose resolved workspace equals *path*.
+
+    Dispatch gate: a second worker must never spawn beside a live run in the
+    same workspace — two writers interleave edits in one checkout and leave it
+    transiently broken (2026-10-27 thread-truth: a half-applied rename left
+    ``NameError`` at the call site). Returns ``None`` when no other live claim
+    resolves to the same path.
+    """
+    key = workspace_identity(path)
+    if not key:
+        return None
+    for row in conn.execute(_LIVE_CLAIM_PATHS_SQL, (task_id,)):
+        if workspace_identity(row["workspace_path"]) == key:
+            return row["id"]
+    return None
+
+
 def _defer_shared_workspace_cleanup(
     conn: sqlite3.Connection, task_id: str, path: Path | str
 ) -> bool:

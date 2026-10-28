@@ -130,6 +130,11 @@ class DispatchResult:
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
+    skipped_workspace_busy: list[tuple[str, str, str]] = field(default_factory=list)
+    """``(task_id, workspace_path, holder_task_id)`` deferred because another
+    live claim already holds that resolved workspace. One workspace = one
+    writer; the card stays ``ready`` and is picked up on the tick after the
+    holder's claim is released."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -174,6 +179,8 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts[reason] = counts.get(reason, 0) + 1
         if res.rate_limited:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
+        if res.skipped_workspace_busy:
+            counts["workspace_busy"] = counts.get("workspace_busy", 0) + len(res.skipped_workspace_busy)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
@@ -1364,6 +1371,25 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     return sweep.crashed
 
 
+def _last_event_is(conn: sqlite3.Connection, task_id: str, kind: str, payload: dict) -> bool:
+    """True when *task_id*'s latest event already carries ``kind`` + ``payload``.
+
+    A condition that repeats on every tick (unknown assignee, workspace held by
+    a live claim) must be recorded once per contiguous hold, not one row per
+    tick forever.
+    """
+    last = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return (
+        last is not None
+        and last["kind"] == kind
+        and last["payload"] == _kb._json_or_null(payload)
+    )
+
+
 def _record_task_failure(
     conn: sqlite3.Connection,
     task_id: str,
@@ -1376,6 +1402,7 @@ def _record_task_failure(
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
     infrastructure: bool = False,
+    dedupe_event: bool = False,
 ) -> bool:
     """Record a non-success outcome and maybe trip the circuit breaker; every
     non-success path funnels through here so ``consecutive_failures`` stays
@@ -1394,6 +1421,9 @@ def _record_task_failure(
     with ``infrastructure: true`` but ``consecutive_failures`` is left alone and
     the breaker never trips; the card stays retryable and
     :func:`check_respawn_guard` spaces the retries.
+
+    ``dedupe_event=True``: skip the event when the latest one is already the
+    same ``kind``+payload (a per-tick deferral writes its reason once).
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
@@ -1443,7 +1473,11 @@ def _record_task_failure(
                 run_id = _kb._end_run(
                     conn, task_id, outcome=outcome, status=outcome, error=error, metadata=detail,
                 )
-                _kb._append_event(conn, task_id, outcome, {"error": error, **detail}, run_id=run_id)
+                payload = {"error": error, **detail}
+                if event_payload_extra:
+                    payload.update(event_payload_extra)
+                if not (dedupe_event and _last_event_is(conn, task_id, outcome, payload)):
+                    _kb._append_event(conn, task_id, outcome, payload, run_id=run_id)
             return False
 
         # Spawn path (release_claim) is still running and also clears claim
@@ -2096,11 +2130,7 @@ def _dispatch_lane_task(
         # and not one row per foreign home per tick on a shared board (#101015).
         if not dry_run:
             with _kb.write_txn(conn):
-                last = conn.execute(
-                    "SELECT kind, payload FROM task_events WHERE task_id = ? "
-                    "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
-                if (last is None or last["kind"] != "skipped_nonspawnable"
-                        or last["payload"] != _kb._json_or_null({"assignee": assignee})):
+                if not _last_event_is(conn, task_id, "skipped_nonspawnable", {"assignee": assignee}):
                     _kb._append_event(conn, task_id, "skipped_nonspawnable", {"assignee": assignee})
         return False
     # Per-profile cap: one profile's local model / API quota / browser pool
@@ -2135,22 +2165,56 @@ def _dispatch_lane_task(
         result.spawned.append((task_id, assignee, ""))
         _count_spawn(assignee)
         return True
-    claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
-    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
-    if claimed is None:
+    # Resolve the workspace BEFORE claiming: the resolved path is what decides
+    # whether this card may spawn at all (one workspace = one writer). Claiming
+    # first would open a run row plus a ``claimed`` event on every tick a held
+    # workspace defers the card. Resolution is deterministic per task id, so
+    # doing it pre-claim does not change what the card would run in.
+    task = _kb.get_task(conn, task_id)
+    if task is None:
         return False
     try:
         resolved_branch_name = None
-        if claimed.workspace_kind == "worktree":
-            workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
+        if task.workspace_kind == "worktree":
+            workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(task, board=board)
         else:
-            workspace = _kbw.resolve_workspace(claimed, board=board)
+            workspace = _kbw.resolve_workspace(task, board=board)
     except Exception as exc:
+        # No claim yet: nothing to release, but the attempt is still recorded
+        # (event with a NULL run id, failure counter, breaker at the limit).
         if _record_task_failure(
-            conn, claimed.id, f"workspace: {exc}",
-            outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+            conn, task_id, f"workspace: {exc}",
+            outcome="spawn_failed", failure_limit=failure_limit, end_run=True,
         ):
-            result.auto_blocked.append(claimed.id)
+            result.auto_blocked.append(task_id)
+        return False
+    # One workspace = one writer. A live claim that already holds this resolved
+    # path must never get a second worker beside it: two writers interleave
+    # edits in one checkout (2026-10-27 thread-truth: a half-applied rename left
+    # ``NameError`` at the call site). The card stays in its lane with the
+    # reason recorded — never spawned beside the holder, never dropped silently.
+    holder = _kbw.workspace_claim_holder(conn, task_id, workspace)
+    if holder is not None:
+        result.skipped_workspace_busy.append((task_id, str(workspace), holder))
+        _kb._log.warning(
+            "kanban dispatch: deferring %s — workspace %s is held by the live "
+            "claim of %s", task_id, workspace, holder,
+        )
+        # The stamped ``last_failure_error`` stays free of the filesystem path:
+        # check_respawn_guard matches quota/auth words in it, and a path like
+        # ``auth-service`` would park a card that is only WAITING. The path
+        # rides the event payload instead.
+        _record_task_failure(
+            conn, task_id,
+            f"workspace busy: held by the live claim of {holder}",
+            outcome="workspace_busy", failure_limit=failure_limit,
+            infrastructure=True, dedupe_event=True, end_run=True,
+            event_payload_extra={"workspace": str(workspace), "holder_task_id": holder},
+        )
+        return False
+    claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
+    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
+    if claimed is None:
         return False
     _kbw.set_workspace_path(conn, claimed.id, str(workspace))
     if claimed.workspace_kind == "worktree":
