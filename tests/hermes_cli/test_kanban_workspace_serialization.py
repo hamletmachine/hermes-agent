@@ -958,6 +958,31 @@ def test_dead_claim_owner_does_not_hold_a_workspace(tmp_path, monkeypatch):
     )
 
 
+def test_dead_claim_owner_with_a_live_worker_still_holds(tmp_path, monkeypatch):
+    """A gateway restart kills the claim owner, not the detached worker."""
+    _isolated_home(tmp_path, monkeypatch)
+    shared = tmp_path / "one-worktree"
+    shared.mkdir()
+    with kbc.connect() as conn:
+        holder = kb.create_task(
+            conn, title="holder", assignee="red",
+            workspace_kind="dir", workspace_path=str(shared),
+        )
+        second = kb.create_task(
+            conn, title="second", assignee="red",
+            workspace_kind="dir", workspace_path=str(shared),
+        )
+        _hold_claim(conn, holder)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET claim_lock = ?, worker_pid = ? WHERE id = ?",
+                (f"{kb._host_prefix()}999999", os.getpid(), holder),
+            )
+        claim = kbw.workspace_claim_holder(conn, second, str(shared))
+    assert claim.status == "busy"
+    assert claim.holder_task_id == holder
+
+
 def test_busy_gate_releases_a_competing_dispatchers_claim(tmp_path, monkeypatch):
     """The 02:55 red7 race: A claims, B's gate defers, and B left the claim.
 

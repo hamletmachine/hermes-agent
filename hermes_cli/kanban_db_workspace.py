@@ -262,13 +262,13 @@ _LIVE_CLAIM_PREDICATE = (
     "status = 'running' AND claim_lock IS NOT NULL AND workspace_path IS NOT NULL"
 )
 _LIVE_CLAIM_PATHS_SQL = (
-    f"SELECT id, workspace_path, claim_lock FROM tasks "
+    f"SELECT id, workspace_path, claim_lock, worker_pid FROM tasks "
     f"WHERE id != ? AND {_LIVE_CLAIM_PREDICATE}"
 )
 # Sibling boards mint their own ids, so the id being dispatched here can name a
 # different live task there. Do not exclude it.
 _LIVE_CLAIM_PATHS_ANY_SQL = (
-    f"SELECT id, workspace_path, claim_lock FROM tasks WHERE {_LIVE_CLAIM_PREDICATE}"
+    f"SELECT id, workspace_path, claim_lock, worker_pid FROM tasks WHERE {_LIVE_CLAIM_PREDICATE}"
 )
 
 
@@ -330,11 +330,33 @@ class WorkspaceClaim:
     holder_board: Optional[str] = None
 
 
+def claim_row_is_live(row: sqlite3.Row) -> bool:
+    """True when a running+claimed row still has something that can write.
+
+    The claim lock names the DISPATCHER pid, not the worker. A gateway restart
+    kills that pid while the detached worker keeps writing under the old lock,
+    so claim-owner liveness alone would falsely free a live checkout. A live
+    ``worker_pid`` always wins; the claim owner is consulted only when no
+    worker is recorded (a claim that never reached spawn).
+    """
+    pid = row["worker_pid"]
+    if pid:
+        try:
+            from hermes_cli.kanban_db_dispatch import _pid_alive  # late: cycle
+            if _pid_alive(int(pid)):
+                return True
+        except Exception:
+            pass
+        # Worker gone: hold until the dispatcher's reclaim pass closes the run.
+        return True
+    return not claim_lock_owner_dead(row["claim_lock"])
+
+
 def _claim_in_rows(
     rows: Iterable[sqlite3.Row], key: str, board: Optional[str]
 ) -> Optional[WorkspaceClaim]:
     for row in rows:
-        if claim_lock_owner_dead(row["claim_lock"]):
+        if not claim_row_is_live(row):
             continue
         if workspace_identity(row["workspace_path"]) == key:
             return WorkspaceClaim("busy", row["id"], board)

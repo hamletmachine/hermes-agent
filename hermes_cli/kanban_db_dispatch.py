@@ -2272,6 +2272,9 @@ def _dispatch_lane_task(
         release_claim = False
         fresh = _kb.get_task(conn, task_id)  # the claim can land after our snapshot
         if fresh is not None and fresh.status == "running":
+            worker_pid = getattr(fresh, "worker_pid", None)
+            if worker_pid and _kb._pid_alive(int(worker_pid)):
+                return False  # a spawned worker owns this run
             if not _kbw.claim_lock_owner_dead(fresh.claim_lock):
                 return False
             release_claim = True
