@@ -16,10 +16,14 @@ Pinned behaviors (t_cee58630 BLOCK round + 10-28 satellite delivery defect):
      room);
   4. the primary profile keeps resolving through its own map; the satellite fallback
      guard only returns None when that resolution already failed.
+  5. the gate-OPEN verdict logs at INFO (reaches the INFO+ gateway.log file handler),
+     once per event — deduped across the batch double-pass and the ~2s re-offer replay
+     (review t_2a24734e follow-up; the DEBUG line was invisible to the file handler).
 """
 import asyncio
 import ast
 import sys
+import time
 import types
 from pathlib import Path
 from unittest import mock
@@ -43,6 +47,9 @@ class _StubAdapter:
 class _Logger:
     def __init__(self):
         self.records = []
+
+    def info(self, msg, *args):
+        self.records.append(("info", msg % args if args else msg))
 
     def warning(self, msg, *args):
         self.records.append(("warning", msg % args if args else msg))
@@ -189,10 +196,27 @@ def test_raw_api_server_lane_is_not_a_delivery_lane(push_capable, expected_reaso
     assert expected_reason in warnings[0]
 
 
-def test_ready_reports_open_for_a_healthy_legacy_event(monkeypatch):
-    """Source builds + adapter resolves + push supported → gate OPEN, and the OPEN line is
-    logged at DEBUG (normal traffic must not spam WARNING cadence). Uses the REAL async
-    asyncio.to_thread — the bound `_build_process_event_source` is a plain callable."""
+def _gate_open_exec(mod, window=600.0):
+    """Exec the REAL `_log_gate_open_once` with a FRESH memo dict (per-test isolation).
+
+    The memo and window live at module level in the source; binding fresh ones here keeps
+    tests order-independent and lets the window be shortened for the expiry leg.
+    """
+    memo = {}
+    fn = _exec(mod, "_log_gate_open_once", extra_globals={
+        "_gate_open_recently": memo,
+        "_GATE_OPEN_DEDUPE_SECONDS": window,
+        "time": time,
+    })
+    return fn, memo
+
+
+def test_ready_reports_open_at_info_once_per_event(monkeypatch):
+    """Source builds + adapter resolves + push supported → gate OPEN logged at INFO, exactly
+    once per event, carrying delegation_id + session_key (review t_2a24734e follow-up: the
+    DEBUG line never reached the INFO+ gateway.log file handler, so the success case left no
+    positive trace). Asserts the LEVEL, not just the message — a caplog-at-DEBUG assertion
+    proves nothing about the file handler. Uses the REAL asyncio.to_thread."""
     from gateway.run_notifications import Platform as _real_platform_cls
     mod, log = _module_namespace()
     wake_mod = __import__("gateway.wake", fromlist=["adapter_supports_push"])
@@ -204,26 +228,64 @@ def test_ready_reports_open_for_a_healthy_legacy_event(monkeypatch):
 
     with mock.patch.object(wake_mod, "adapter_supports_push", lambda a: True, create=True), \
          mock.patch.dict(sys.modules, {"gateway.wake": wake_mod}, create=True):
-        # Exec the fn with the stubs bound in ITS namespace (the function reads its own
-        # globals; patching the real module doesn't reach it).
         import gateway.run_notifications as real
-        ns = dict(mod.__dict__)
-        ns["_build_process_event_source"] = make_source
+        gate_open, _memo = _gate_open_exec(mod)
         runner = _runner({"black": {"api_server": _StubAdapter("black-console")}}, {"matrix": shared})
-        ns["_resolve_injection_adapter"] = lambda platform, source: shared
         runner._build_process_event_source = make_source
         runner._resolve_injection_adapter = lambda platform, source: shared
         fn = _exec(mod, "_completion_delivery_ready", extra_globals={
             "_build_process_event_source": make_source,
             "_resolve_injection_adapter": lambda platform, source: shared,
+            "_log_gate_open_once": gate_open,
             "Platform": real.Platform,
         })
         # parent_session_id omitted: classification walks the sessions DB only when a parent
         # is present; the raw OPEN path is what this test pins.
-        result = asyncio.run(fn(runner, {"session_key": "agent:black:matrix:dm:" + BLACK_CHAT}))
+        result = asyncio.run(fn(runner, {
+            "session_key": "agent:black:matrix:dm:" + BLACK_CHAT,
+            "delegation_id": "deleg_open1",
+        }))
     assert result is True
-    opens = [m for level, m in log.records if level == "debug" and "gate OPEN" in m]
-    assert opens, "gate OPEN must be logged at debug"
+    opens = [m for level, m in log.records if level == "info" and "gate OPEN" in m]
+    assert len(opens) == 1, f"exactly one gate-OPEN line per event, got {opens}"
+    assert "deleg_open1" in opens[0] and "session_key" in opens[0]
+    assert not [m for level, m in log.records if level == "debug" and "gate OPEN" in m], \
+        "gate OPEN must not log at DEBUG (invisible to the INFO+ file handler)"
+
+
+def test_gate_open_dedupes_repeat_passes_of_one_event():
+    """The async-delegation group pre-check gates every sibling, then the primary passes the
+    gate AGAIN in its own preflight — the same event reaches `_completion_delivery_ready`
+    twice per delivery. The INFO line must dedupe to one per event (no duplicate pair), and
+    a second delegation must still get its own line."""
+    mod, log = _module_namespace()
+    gate_open, _memo = _gate_open_exec(mod)
+    evt = {"delegation_id": "deleg_dup", "session_key": "agent:black:matrix:dm:" + BLACK_CHAT}
+    assert gate_open(evt) is None and gate_open(evt) is None  # both passes, one line
+    infos = [m for level, m in log.records if level == "info" and "gate OPEN" in m]
+    assert len(infos) == 1, f"repeat passes of one event must dedupe, got {infos}"
+    gate_open({"delegation_id": "deleg_next", "session_key": "agent:black:matrix:dm:" + BLACK_CHAT})
+    assert len([m for level, m in log.records if level == "info" and "gate OPEN" in m]) == 2
+
+
+def test_gate_open_relogs_after_window_expiry():
+    """A deferred row is re-offered every ~2s; inside the window those replays stay silent,
+    but after the window a redelivery logs honestly (the dedupe is a flood guard, not a
+    per-delegation one-shot)."""
+    mod, log = _module_namespace()
+    gate_open, _memo = _gate_open_exec(mod, window=0.0)
+    evt = {"delegation_id": "deleg_replay", "session_key": "s"}
+    gate_open(evt)
+    gate_open(evt)  # window already expired (0.0s): logs again
+    infos = [m for level, m in log.records if level == "info" and "gate OPEN" in m]
+    assert len(infos) == 2, f"expired window must relog, got {infos}"
+
+
+def test_gate_open_window_is_a_real_flood_guard():
+    """The shipped window must actually bound per-poll spam (~12 events/minute, 10-28 log):
+    long enough to swallow the replay cadence, short enough that a much-later redelivery logs."""
+    import gateway.run_notifications as real
+    assert 60 <= real._GATE_OPEN_DEDUPE_SECONDS <= 3600
 
 
 # ----------------------------------------------------------- shared-bot fallback legs

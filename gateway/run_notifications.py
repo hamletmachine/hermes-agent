@@ -121,6 +121,37 @@ def _asdi_primary_routes_for(profile_name: str) -> list:
     return _primary_routes_for_profile(profile_name)
 
 
+_GATE_OPEN_DEDUPE_SECONDS = 600
+_gate_open_recently: dict[tuple[str, str], float] = {}
+
+
+def _log_gate_open_once(evt: dict) -> None:
+    """INFO the positive gate verdict once per delegation per window.
+
+    The gate can legitimately run twice for one event — the async-delegation group
+    pre-check gates every sibling, then the primary passes again in its own preflight —
+    and a deferred row is re-offered every ~2s (10-28 log: ~12 events/minute while
+    pending). Either would flood the INFO+ gateway.log file handler; the single-exit
+    gate-OFF already gives one line per pass, so the OPEN line dedupes to one per
+    delegation per window. Log-only: gate return values are untouched, and a redelivery
+    after the window logs honestly (review t_2a24734e follow-up).
+    """
+    key = (str(evt.get("delegation_id") or ""), str(evt.get("session_key") or ""))
+    now = time.monotonic()
+    last = _gate_open_recently.get(key)
+    if last is not None and now - last < _GATE_OPEN_DEDUPE_SECONDS:
+        return
+    if len(_gate_open_recently) > 512:
+        for stale in [k for k, ts in _gate_open_recently.items()
+                      if now - ts >= _GATE_OPEN_DEDUPE_SECONDS]:
+            del _gate_open_recently[stale]
+    _gate_open_recently[key] = now
+    logger.info(
+        "Async-completion delivery gate OPEN: delegation_id=%s (session_key=%r parent=%s)",
+        evt.get("delegation_id"), evt.get("session_key"), evt.get("parent_session_id"),
+    )
+
+
 def _local_completion_card(evt: dict) -> dict[str, str]:
     """The card of a local process notice: the async-result card the in-process TUI wrote for a
     completion or async delegation (a gateway-side ``/review`` reports as one), and a liveness tick's
@@ -1079,7 +1110,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
 
         Every False branch logs here: this gate was a silent killer for satellite
         async completions (10-28: deleg_4d102669/deleg_efcbb8ca spun pending/0-attempts
-        with zero observable evidence). WARNING on False, debug on the ready path.
+        with zero observable evidence). WARNING on False, deduped INFO on the ready path.
         """
         from gateway.wake import adapter_supports_push
 
@@ -1127,7 +1158,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             except Exception:
                 logger.warning("Async-completion delivery DB unavailable", exc_info=True)
                 return await _gate_off("adapter push check raised (session db unavailable)")
-        logger.debug("Async-completion delivery gate OPEN (%s)", evt.get("delegation_id"))
+        _log_gate_open_once(evt)
         return True
 
     async def _preflight_completion_delivery(self, evt: dict) -> _CompletionClaim:
