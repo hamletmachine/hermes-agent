@@ -141,6 +141,53 @@ def add_notify_sub(
             )
 
 
+def board_notify_target(board: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """Route-owning destination from ``board.json``'s ``notify`` block, or None.
+
+    Cards created by a CLI or a dispatcher-spawned worker have no gateway
+    session ContextVars, so the per-session auto-subscribe path cannot bind
+    them. A board may name its operator destination; the board owner's profile
+    stamps the subscription because a foreign profile's stamp silently drops
+    delivery on a standalone gateway.
+    """
+    try:
+        from hermes_cli.kanban_db_boards import read_board_metadata
+        meta = read_board_metadata(board)
+    except Exception:
+        return None
+    raw = meta.get("notify")
+    if not isinstance(raw, dict):
+        return None
+    platform = str(raw.get("platform") or "").strip()
+    chat_id = str(raw.get("chat_id") or "").strip()
+    if not platform or not chat_id:
+        return None
+    profile = str(raw.get("notifier_profile") or meta.get("owner_profile") or "").strip()
+    if not profile:
+        from hermes_cli.profiles import current_profile_name
+        profile = current_profile_name("default")
+    metadata = raw.get("delivery_metadata")
+    return dict(
+        platform=platform, chat_id=chat_id,
+        chat_type=raw.get("chat_type"), thread_id=raw.get("thread_id"),
+        user_id=raw.get("user_id"), user_id_alt=raw.get("user_id_alt"),
+        notifier_profile=profile,
+        delivery_mode=raw.get("delivery_mode") or "notify+wake",
+        delivery_metadata=metadata if isinstance(metadata, dict) else None,
+    )
+
+
+def auto_subscribe_board(
+    conn: sqlite3.Connection, task_id: str, *, board: Optional[str] = None,
+) -> bool:
+    """Subscribe *task_id* to the board's configured destination; True iff a row exists."""
+    target = board_notify_target(board)
+    if target is None:
+        return False
+    add_notify_sub(conn, task_id=task_id, **target)
+    return True
+
+
 def _notify_profile_filter(
     notifier_profiles: Optional[Iterable[str]],
     *,
