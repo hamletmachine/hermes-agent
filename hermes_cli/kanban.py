@@ -379,6 +379,16 @@ def _cmd_create(args: argparse.Namespace) -> int:
                              if is_dispatcher_owned_worker_context() else None),
         )
         task = kb.get_task(conn, task_id)
+        # CLI-created cards have no gateway ContextVars. Subscribe the board's
+        # configured operator destination so their terminal transitions are
+        # visible instead of silently dying with the card.
+        try:
+            from hermes_cli import kanban_db_notify as _kbn
+            _kbn.auto_subscribe_board(
+                conn, task_id, board=getattr(args, "board", None),
+            )
+        except Exception:
+            pass
     if getattr(args, "json", False):
         _print_json(_task_to_dict(task))
     else:

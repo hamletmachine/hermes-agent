@@ -61,6 +61,19 @@ def test_worker_created_card_inherits_the_board_notify_target(tmp_path, monkeypa
     assert subs[0]["delivery_mode"] == "notify+wake"
 
 
+def test_cli_helper_subscribes_the_board_target(tmp_path, monkeypatch):
+    """The CLI create path calls the shared helper, not the tool handler."""
+    _isolated_home(tmp_path, monkeypatch)
+    _board_with_notify()
+    with kbc.connect(board="red7") as conn:
+        tid = kb.create_task(conn, title="cli card", assignee="red")
+        ok = kbn.auto_subscribe_board(conn, tid, board="red7")
+        subs = kbn.list_notify_subs(conn, task_id=tid)
+    assert ok is True
+    assert len(subs) == 1, subs
+    assert subs[0]["chat_id"] == "!operator:matrix.org"
+
+
 def test_no_board_target_keeps_the_old_no_subscription_behaviour(tmp_path, monkeypatch):
     _isolated_home(tmp_path, monkeypatch)
     create_board("red7")
