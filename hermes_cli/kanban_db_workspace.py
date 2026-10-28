@@ -13,7 +13,9 @@ import sqlite3
 import subprocess
 import time
 import unicodedata
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 from typing import Optional
 from typing import TYPE_CHECKING
 import contextlib
@@ -120,27 +122,43 @@ def _conn_uses_path(
     return False
 
 
-def _sibling_board_db_files(conn: sqlite3.Connection) -> list[Path]:
-    """Every other board's ``kanban.db``. Raises ``OSError`` when the set is unknown.
+def _sibling_board_db_files(conn: sqlite3.Connection) -> list[tuple[str, Path]]:
+    """``(slug, kanban.db)`` for every other board. Raises ``OSError`` when the set is unknown.
 
     ``kanban_db_path`` follows ``HERMES_KANBAN_DB`` and would collapse every
     slug onto the pinned file, so the scan uses the on-disk layout: the
     default board at ``<home>/kanban.db`` and named boards at
-    ``<home>/kanban/boards/<slug>/kanban.db``.
+    ``<home>/kanban/boards/<slug>/kanban.db``. The slug is a label for
+    operator-facing diagnostics.
+
+    A directory is a board only when ``board.json`` marks it as one
+    (:func:`hermes_cli.kanban_db_boards._dir_holds_board`): archive and
+    hard-delete both leave the directory without that marker, and a stale
+    ``connect(board=slug)`` used to leave a ``kanban.db``-only stub. Scanning
+    such a stub reads as "unreadable board" and, on the dispatch gate, defers
+    EVERY ready card on EVERY board (review of a771bac2b3:
+    ``boards/_archived/kanban.db`` is a 0-byte file on this box).
     """
     from hermes_cli.kanban_db_connect import _main_db_file  # late: import cycle
 
     current_file = _main_db_file(conn)
     current = Path(current_file).resolve() if current_file else None
-    candidates = [_kb.kanban_home() / "kanban.db"]
+    candidates = [(_kb.DEFAULT_BOARD, _kb.kanban_home() / "kanban.db")]
     root = _kb.boards_root()
     if root.is_dir():
         for child in root.iterdir():
-            if child.is_dir():
-                candidates.append(child / "kanban.db")
-    found: list[Path] = []
+            if not child.is_dir():
+                continue
+            if not _kb._dir_holds_board(child):
+                _kb._log.debug(
+                    "kanban board scan: ignoring %s — no board.json (DB-only stub)",
+                    child,
+                )
+                continue
+            candidates.append((child.name, child / "kanban.db"))
+    found: list[tuple[str, Path]] = []
     seen: set[Path] = set()
-    for path in candidates:
+    for slug, path in candidates:
         if not path.is_file():
             continue
         resolved = path.resolve()
@@ -149,18 +167,44 @@ def _sibling_board_db_files(conn: sqlite3.Connection) -> list[Path]:
         if resolved in seen:
             continue
         seen.add(resolved)
-        found.append(resolved)
+        found.append((slug, resolved))
     return found
 
 
-def _other_board_uses_path(db_file: Path, task_id: str, key: str) -> bool:
+@contextlib.contextmanager
+def _open_board_readonly(db_file: Path):
+    """Read-only connection to another board's ``kanban.db``."""
     uri = db_file.as_uri() + "?mode=ro"
     other = sqlite3.connect(uri, uri=True, timeout=1.0)
     try:
         other.row_factory = sqlite3.Row
-        return _conn_uses_path(other, task_id, key, exclude_task_id=False)
+        yield other
     finally:
         other.close()
+
+
+_TASKS_TABLE_SQL = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tasks'"
+
+
+def _board_db_holds_tasks(conn: sqlite3.Connection) -> bool:
+    """False when the database cannot hold a task row, so it holds no claim.
+
+    A file that opens but has no ``tasks`` table is a stub or a board whose
+    schema was never initialized (``create_board`` writes ``board.json``
+    before ``init_db``, and an archived slug's DB is deliberately not
+    recreated). "No table" is proof of zero rows, not an unknown: treating it
+    as unreadable would make one such file defer every ready card on every
+    board forever. A file that is not a SQLite database still raises here —
+    callers keep fail-closed for a real board DB that cannot be read.
+    """
+    return conn.execute(_TASKS_TABLE_SQL).fetchone() is not None
+
+
+def _other_board_uses_path(db_file: Path, task_id: str, key: str) -> bool:
+    with _open_board_readonly(db_file) as other:
+        if not _board_db_holds_tasks(other):
+            return False
+        return _conn_uses_path(other, task_id, key, exclude_task_id=False)
 
 
 def _workspace_in_use_by_other(
@@ -195,7 +239,7 @@ def _workspace_in_use_by_other(
     except OSError as exc:
         _kb._log.warning("Cannot list kanban boards for task %s: %s", task_id, exc)
         return "unknown"
-    for db_file in siblings:
+    for _slug, db_file in siblings:
         try:
             if _other_board_uses_path(db_file, task_id, key):
                 return "shared"
@@ -214,10 +258,16 @@ def _workspace_in_use_by_other(
 # A ``running`` row that still carries a claim is a live writer for this tick:
 # the dispatcher's reclaim phase (stale/crashed/orphaned) runs BEFORE any claim,
 # so a claim that outlived its worker was already released by then.
+_LIVE_CLAIM_PREDICATE = (
+    "status = 'running' AND claim_lock IS NOT NULL AND workspace_path IS NOT NULL"
+)
 _LIVE_CLAIM_PATHS_SQL = (
-    "SELECT id, workspace_path FROM tasks "
-    "WHERE id != ? AND status = 'running' AND claim_lock IS NOT NULL "
-    "AND workspace_path IS NOT NULL"
+    f"SELECT id, workspace_path FROM tasks WHERE id != ? AND {_LIVE_CLAIM_PREDICATE}"
+)
+# Sibling boards mint their own ids, so the id being dispatched here can name a
+# different live task there. Do not exclude it.
+_LIVE_CLAIM_PATHS_ANY_SQL = (
+    f"SELECT id, workspace_path FROM tasks WHERE {_LIVE_CLAIM_PREDICATE}"
 )
 
 
@@ -238,24 +288,81 @@ def workspace_identity(path: Path | str | None) -> Optional[str]:
     return _path_key(resolved)
 
 
+@dataclass(frozen=True)
+class WorkspaceClaim:
+    """Outcome of the dispatch-time workspace exclusivity scan.
+
+    ``status`` is ``"free"`` (no live claim resolves to the path), ``"busy"``
+    (a live claimed run holds it) or ``"unknown"`` (a board database could not
+    be read, so a live claim elsewhere cannot be ruled out).
+    ``holder_task_id`` names the live run when ``status == "busy"``;
+    ``holder_board`` names its board when the claim lives on a SIBLING board
+    (``None`` means this board).
+    """
+
+    status: str
+    holder_task_id: Optional[str] = None
+    holder_board: Optional[str] = None
+
+
+def _claim_in_rows(
+    rows: Iterable[sqlite3.Row], key: str, board: Optional[str]
+) -> Optional[WorkspaceClaim]:
+    for row in rows:
+        if workspace_identity(row["workspace_path"]) == key:
+            return WorkspaceClaim("busy", row["id"], board)
+    return None
+
+
 def workspace_claim_holder(
     conn: sqlite3.Connection, task_id: str, path: Path | str
-) -> Optional[str]:
-    """Task id of a live claimed run whose resolved workspace equals *path*.
+) -> WorkspaceClaim:
+    """Live claimed run whose resolved workspace equals *path*, on ANY board.
 
     Dispatch gate: a second worker must never spawn beside a live run in the
     same workspace — two writers interleave edits in one checkout and leave it
     transiently broken (2026-10-27 thread-truth: a half-applied rename left
-    ``NameError`` at the call site). Returns ``None`` when no other live claim
-    resolves to the same path.
+    ``NameError`` at the call site). The board is not the boundary of that
+    hazard: cards on DIFFERENT boards resolve the same directory through
+    separate DBs, so the sibling boards are scanned with the SAME live-claim
+    predicate (``status='running' AND claim_lock IS NOT NULL``) used here.
+
+    Returns ``"busy"`` with the holder for a live claim, ``"free"`` when none
+    resolves to the path, and ``"unknown"`` when a board DB cannot be read.
+    Callers must treat ``"unknown"`` as held: a false defer leaves the card
+    visible in its lane, a false spawn corrupts a checkout.
     """
     key = workspace_identity(path)
     if not key:
-        return None
-    for row in conn.execute(_LIVE_CLAIM_PATHS_SQL, (task_id,)):
-        if workspace_identity(row["workspace_path"]) == key:
-            return row["id"]
-    return None
+        return WorkspaceClaim("free")
+    local = _claim_in_rows(conn.execute(_LIVE_CLAIM_PATHS_SQL, (task_id,)), key, None)
+    if local is not None:
+        return local
+    try:
+        siblings = _sibling_board_db_files(conn)
+    except OSError as exc:
+        _kb._log.warning("Cannot list kanban boards for task %s: %s", task_id, exc)
+        return WorkspaceClaim("unknown")
+    for slug, db_file in siblings:
+        try:
+            with _open_board_readonly(db_file) as other:
+                if not _board_db_holds_tasks(other):
+                    _kb._log.debug(
+                        "kanban workspace gate: ignoring %s — no tasks table (stub board)",
+                        db_file,
+                    )
+                    continue
+                found = _claim_in_rows(
+                    other.execute(_LIVE_CLAIM_PATHS_ANY_SQL), key, slug
+                )
+        except (OSError, sqlite3.Error) as exc:
+            _kb._log.warning(
+                "Cannot read board db %s for task %s: %s", db_file, task_id, exc,
+            )
+            return WorkspaceClaim("unknown")
+        if found is not None:
+            return found
+    return WorkspaceClaim("free")
 
 
 def creator_workspace_inheritance(
