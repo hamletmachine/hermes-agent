@@ -135,6 +135,12 @@ class DispatchResult:
     live claim already holds that resolved workspace. One workspace = one
     writer; the card stays in its lane (``ready``, or ``review`` for a review
     card) and is picked up on the tick after the holder's claim is released."""
+    skipped_workspace_unknown: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, workspace_path)`` deferred because a board database could
+    not be read, so a live claim on that resolved workspace could not be ruled
+    out. Fail closed and tracked apart from ``skipped_workspace_busy`` so an
+    operator can tell "held" from "cannot tell"; the card keeps its lane and no
+    failure is counted."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -181,6 +187,10 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
         if res.skipped_workspace_busy:
             counts["workspace_busy"] = counts.get("workspace_busy", 0) + len(res.skipped_workspace_busy)
+        if res.skipped_workspace_unknown:
+            counts["workspace_busy_unknown"] = (
+                counts.get("workspace_busy_unknown", 0) + len(res.skipped_workspace_unknown)
+            )
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
@@ -2189,27 +2199,58 @@ def _dispatch_lane_task(
             result.auto_blocked.append(task_id)
         return False
     # One workspace = one writer. A live claim that already holds this resolved
-    # path must never get a second worker beside it: two writers interleave
-    # edits in one checkout (2026-10-27 thread-truth: a half-applied rename left
-    # ``NameError`` at the call site). The card stays in its lane with the
-    # reason recorded — never spawned beside the holder, never dropped silently.
-    holder = _kbw.workspace_claim_holder(conn, task_id, workspace)
-    if holder is not None:
+    # path must never get a second worker beside it — on THIS board or on a
+    # sibling board: two writers interleave edits in one checkout (2026-10-27
+    # thread-truth: a half-applied rename left ``NameError`` at the call site).
+    # The card stays in its lane with the reason recorded — never spawned
+    # beside the holder, never dropped silently.
+    workspace_claim = _kbw.workspace_claim_holder(conn, task_id, workspace)
+    if workspace_claim.status == "unknown":
+        # A board DB could not be read, so a live claim there cannot be ruled
+        # out: fail CLOSED. A false defer leaves the card visible in ``ready``;
+        # a false spawn corrupts a checkout.
+        result.skipped_workspace_unknown.append((task_id, str(workspace)))
+        _kb._log.warning(
+            "kanban dispatch: deferring %s — cannot tell whether a live run "
+            "holds workspace %s (a board db could not be read)",
+            task_id, workspace,
+        )
+        # Distinct outcome from ``workspace_busy`` so an operator can tell
+        # "held" from "cannot tell". Same non-punitive shape: no failure
+        # counted, one event per contiguous hold, card stays in its lane. The
+        # stamped ``last_failure_error`` stays free of the filesystem path:
+        # check_respawn_guard matches quota/auth words in it, and a path like
+        # ``auth-service`` would park a card that is only WAITING.
+        _record_task_failure(
+            conn, task_id,
+            "workspace busy: cannot tell whether another board's live run holds it",
+            outcome="workspace_busy_unknown", failure_limit=failure_limit,
+            infrastructure=True, dedupe_event=True, end_run=True,
+            event_payload_extra={"workspace": str(workspace)},
+        )
+        return False
+    if workspace_claim.status == "busy":
+        holder = workspace_claim.holder_task_id or ""
         result.skipped_workspace_busy.append((task_id, str(workspace), holder))
         _kb._log.warning(
             "kanban dispatch: deferring %s — workspace %s is held by the live "
-            "claim of %s", task_id, workspace, holder,
+            "claim of %s%s",
+            task_id, workspace, holder,
+            f" on board {workspace_claim.holder_board}" if workspace_claim.holder_board else "",
         )
         # The stamped ``last_failure_error`` stays free of the filesystem path:
         # check_respawn_guard matches quota/auth words in it, and a path like
         # ``auth-service`` would park a card that is only WAITING. The path
         # rides the event payload instead.
+        extra = {"workspace": str(workspace), "holder_task_id": holder}
+        if workspace_claim.holder_board is not None:
+            extra["holder_board"] = workspace_claim.holder_board
         _record_task_failure(
             conn, task_id,
             f"workspace busy: held by the live claim of {holder}",
             outcome="workspace_busy", failure_limit=failure_limit,
             infrastructure=True, dedupe_event=True, end_run=True,
-            event_payload_extra={"workspace": str(workspace), "holder_task_id": holder},
+            event_payload_extra=extra,
         )
         return False
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
