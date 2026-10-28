@@ -1157,6 +1157,7 @@ class TestSharedBoardPaths:
             tenant=None,
             branch_name="wt/t_dispatch_env",
         )
+        monkeypatch.setattr(kbd, "_restart_safe_worker_argv", lambda task, cmd: cmd)
         kbd._default_spawn(task, str(tmp_path / "ws"))
 
         env = captured["env"]
@@ -1664,6 +1665,7 @@ def test_default_spawn_pins_repo_root_on_module_worker_pythonpath(tmp_path, monk
 
     for resolved in ([sys.executable, "-m", "hermes_cli.main"], ["/opt/hermes/bin/hermes"]):
         monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda resolved=resolved: resolved)
+        monkeypatch.setattr(kbd, "_restart_safe_worker_argv", lambda task, cmd: cmd)
         kbd._default_spawn(task, str(tmp_path / "ws"))
         assert captured["cmd"][-3:] == [sys.executable, "-m", "hermes_cli.kanban_worker_client"]
         assert captured["env"]["PYTHONPATH"].split(os.pathsep)[0] == root
