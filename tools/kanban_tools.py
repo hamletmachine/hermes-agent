@@ -1259,7 +1259,7 @@ def _handle_create(args: dict, **kw) -> str:
         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
         return _ok(task_id=new_tid, **landed, **gate,
-                   subscribed=_maybe_auto_subscribe(conn, new_tid))
+                   subscribed=_maybe_auto_subscribe(conn, new_tid, board=args.get("board")))
 
 
 def _live_tui_session_key(session_key: str, profile: Optional[str]) -> str:
@@ -1334,7 +1334,43 @@ def _resolve_notify_target() -> Optional[dict[str, Any]]:
         delivery_metadata=delivery_metadata or None)
 
 
-def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
+def _board_notify_target(board: Optional[str]) -> Optional[dict[str, Any]]:
+    """Per-board fallback destination from ``board.json`` (``notify``), or None.
+
+    A card created by a CLI or dispatcher-spawned worker has no gateway session
+    ContextVars, so :func:`_resolve_notify_target` returns None and the card
+    never notifies anyone. ``board.json`` may name the route-owning
+    destination; the board owner's profile stamps the subscription because a
+    foreign profile's stamp silently drops delivery on a standalone gateway.
+    """
+    try:
+        from hermes_cli.kanban_db_boards import read_board_metadata
+        meta = read_board_metadata(board)
+    except Exception:
+        return None
+    raw = meta.get("notify")
+    if not isinstance(raw, dict):
+        return None
+    platform = str(raw.get("platform") or "").strip()
+    chat_id = str(raw.get("chat_id") or "").strip()
+    if not platform or not chat_id:
+        return None
+    profile = str(raw.get("notifier_profile") or meta.get("owner_profile") or "").strip()
+    if not profile:
+        from hermes_cli.profiles import current_profile_name
+        profile = current_profile_name("default")
+    metadata = raw.get("delivery_metadata")
+    return dict(
+        platform=platform, chat_id=chat_id,
+        chat_type=raw.get("chat_type"), thread_id=raw.get("thread_id"),
+        user_id=raw.get("user_id"), user_id_alt=raw.get("user_id_alt"),
+        notifier_profile=profile,
+        delivery_mode=raw.get("delivery_mode") or "notify+wake",
+        delivery_metadata=metadata if isinstance(metadata, dict) else None,
+    )
+
+
+def _maybe_auto_subscribe(conn: Any, task_id: str, *, board: Optional[str] = None) -> bool:
     """Subscribe the calling session to completion/block events; True iff a row was
     written (surfaced as ``subscribed`` so an orchestrator can fall back to explicit
     ``kanban_notify-subscribe``). Gated by ``kanban.auto_subscribe_on_create`` (default
@@ -1346,7 +1382,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         pass  # unreadable config keeps the user-friendly default (True)
     target = None
     try:
-        target = _resolve_notify_target()
+        target = _resolve_notify_target() or _board_notify_target(board)
         if target is None:
             return False  # CLI / cron / test — no persistent channel
         from hermes_cli import kanban_db_notify as _kbn

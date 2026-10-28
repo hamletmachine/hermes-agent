@@ -924,3 +924,83 @@ def test_cleanup_scan_ignores_db_only_stub_dirs(tmp_path, monkeypatch):
         )
         verdict = kbw._workspace_in_use_by_other(conn, task, shared)
     assert verdict is None, f"stub dir made cleanup refuse: {verdict!r}"
+
+
+def test_dead_claim_owner_does_not_hold_a_workspace(tmp_path, monkeypatch):
+    """A claim row whose owner process is gone is not a live writer.
+
+    A dispatcher dying between ``claim_task`` and ``spawn`` leaves
+    ``status='running'`` + ``claim_lock='island:<dead-pid>'`` with no worker.
+    The gate used to honour it for the full 4h stale timeout, so every card
+    targeting that checkout starved beside a process that cannot write.
+    """
+    _isolated_home(tmp_path, monkeypatch)
+    shared = tmp_path / "one-worktree"
+    shared.mkdir()
+    with kbc.connect() as conn:
+        holder = kb.create_task(
+            conn, title="holder", assignee="red",
+            workspace_kind="dir", workspace_path=str(shared),
+        )
+        second = kb.create_task(
+            conn, title="second", assignee="red",
+            workspace_kind="dir", workspace_path=str(shared),
+        )
+        _hold_claim(conn, holder)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET claim_lock = ? WHERE id = ?",
+                (f"{kb._host_prefix()}999999", holder),
+            )
+        claim = kbw.workspace_claim_holder(conn, second, str(shared))
+    assert claim.status == "free", (
+        f"dead claim blocked the checkout: {claim.status} holder={claim.holder_task_id}"
+    )
+
+
+def test_busy_gate_releases_a_competing_dispatchers_claim(tmp_path, monkeypatch):
+    """The 02:55 red7 race: A claims, B's gate defers, and B left the claim.
+
+    Two dispatcher processes can snapshot the same ready row. A claims it; B
+    still reaches the workspace gate and records ``workspace_busy``. B's
+    deferral must release the claim it is looking at, or the card stays
+    ``running`` with ``worker_pid=NULL`` and blocks until the 4h stale sweep.
+    """
+    _isolated_home(tmp_path, monkeypatch)
+    shared = tmp_path / "one-worktree"
+    shared.mkdir()
+    spawn = _Spawn()
+    with kbc.connect() as conn:
+        holder = kb.create_task(
+            conn, title="holder", assignee="red",
+            workspace_kind="dir", workspace_path=str(shared),
+        )
+        second = kb.create_task(
+            conn, title="second", assignee="red",
+            workspace_kind="dir", workspace_path=str(shared),
+        )
+        _hold_claim(conn, holder)
+        _hold_claim(conn, second)  # dispatcher A won the claim race
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET claim_lock = ? WHERE id = ?",
+                (f"{kb._host_prefix()}999999", second),  # A then died
+            )
+        result = kbd.DispatchResult()
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (second,)).fetchone()
+        spawned = kbd._dispatch_lane_task(
+            conn, row, "red", result,
+            lane="ready", dry_run=False, ttl_seconds=None, board=None,
+            failure_limit=2, spawn_fn=spawn, per_profile_cap=None,
+            per_profile_running={},
+        )
+        after = kb.get_task(conn, second)
+        run = kb.latest_run(conn, second)
+    assert spawned is False
+    assert second not in spawn.ids
+    assert after is not None
+    assert after.status == "ready", (
+        f"deferred card stayed {after.status!r} with claim {after.claim_lock!r}"
+    )
+    assert after.claim_lock is None
+    assert run is not None and run.outcome == "workspace_busy"
