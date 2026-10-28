@@ -39,6 +39,16 @@ def _isolated_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # A dispatcher-spawned worker shell carries the live pins (HERMES_KANBAN_DB
+    # et al.); leaving them set would point this fixture at the REAL board.
+    for var in (
+        "HERMES_KANBAN_HOME",
+        "HERMES_KANBAN_DB",
+        "HERMES_KANBAN_BOARD",
+        "HERMES_KANBAN_WORKSPACE",
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+    ):
+        monkeypatch.delenv(var, raising=False)
     kb.init_db()
     from hermes_cli import profiles
 
@@ -1029,3 +1039,63 @@ def test_busy_gate_releases_a_competing_dispatchers_claim(tmp_path, monkeypatch)
     )
     assert after.claim_lock is None
     assert run is not None and run.outcome == "workspace_busy"
+
+
+def test_dry_run_reports_unresolvable_workspace_instead_of_would_spawn(tmp_path, monkeypatch):
+    """RED at 5b978c6ad9: a resolution failure still previewed as "would spawn".
+
+    A real tick records ``spawn_failed`` here and auto-blocks at the failure
+    limit, so a preview that lists the card under ``spawned`` is the same
+    diagnostic lie the held-workspace bucket was added to kill. The dry run
+    must name the failure in its own bucket and still write nothing — and the
+    real tick's report for the same fixture must carry the same reason, so the
+    two can never drift apart again.
+    """
+    _isolated_home(tmp_path, monkeypatch)
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="unresolvable", assignee="red", workspace_kind="worktree",
+        )
+
+    payload = _dry_run_json(monkeypatch)
+    assert tid not in [row["task_id"] for row in payload["spawned"]], payload
+    failures = {
+        row["task_id"]: row["error"]
+        for row in payload["skipped_workspace_unresolvable"]
+    }
+    assert list(failures) == [tid], payload
+    assert "no default_workdir" in failures[tid], failures[tid]
+
+    # Preview only: no claim, no failure counted, no spawn_failed event.
+    with kbc.connect() as conn:
+        row = kb.get_task(conn, tid)
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+    assert row is not None
+    assert row.status == "ready", row.status
+    assert row.claim_lock is None
+    assert row.consecutive_failures == 0
+    assert "spawn_failed" not in kinds, kinds
+
+    # Control: the SAME fixture proves the real tick records the failure the
+    # preview named — tick 1 ``spawn_failed`` (the exact error the preview
+    # reported), tick 2 trips the breaker and blocks the card.
+    spawn = _Spawn()
+    with kbc.connect() as conn:
+        first = kbd.dispatch_once(conn, spawn_fn=spawn, reconcile_orphans=False)
+        row = kb.get_task(conn, tid)
+        events = [(e.kind, e.payload or {}) for e in kb.list_events(conn, tid)]
+        failed = [p for kind, p in events if kind == "spawn_failed"]
+        assert failed, [kind for kind, _p in events]
+        assert first.auto_blocked == [], first
+        assert row is not None and row.status == "ready", row.status if row else None
+        assert row.consecutive_failures == 1, row.consecutive_failures
+        # Same reason, one prefix apart: the two reports cannot drift silently.
+        assert failed[0].get("error") == f"workspace: {failures[tid]}", failed[0]
+
+        second = kbd.dispatch_once(conn, spawn_fn=spawn, reconcile_orphans=False)
+        row = kb.get_task(conn, tid)
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+    assert spawn.ids == []
+    assert tid in second.auto_blocked, second
+    assert row is not None and row.status == "blocked", row.status if row else None
+    assert kinds.count("gave_up") == 1, kinds

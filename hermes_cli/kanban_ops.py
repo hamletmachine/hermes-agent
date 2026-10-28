@@ -113,6 +113,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "workspace": ws}
                 for (tid, ws) in res.skipped_workspace_unknown
             ],
+            "skipped_workspace_unresolvable": [
+                {"task_id": tid, "error": error}
+                for (tid, error) in res.skipped_workspace_unresolvable
+            ],
             "auto_assigned_default": res.auto_assigned_default,
             "respawn_guarded": [
                 {"task_id": tid, "reason": reason}
@@ -153,6 +157,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(f"Deferred (workspace held by live run of {holder}): {tid} @ {ws}")
     for tid, ws in res.skipped_workspace_unknown:
         print(f"Deferred (workspace unknown — a board db could not be read): {tid} @ {ws}")
+    for tid, error in res.skipped_workspace_unresolvable:
+        print(f"Workspace unresolvable ({error}): {tid}")
     if res.skipped_nonspawnable:
         print(
             f"Skipped (non-spawnable assignee — terminal lane, OK): "

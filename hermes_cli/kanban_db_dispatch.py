@@ -141,6 +141,16 @@ class DispatchResult:
     out. Fail closed and tracked apart from ``skipped_workspace_busy`` so an
     operator can tell "held" from "cannot tell"; the card keeps its lane and no
     failure is counted."""
+    skipped_workspace_unresolvable: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, error)`` that a real tick would record as ``spawn_failed``
+    because the card's workspace cannot RESOLVE (``worktree`` with no path and
+    no board ``default_workdir``, a non-absolute or non-git path, ...).
+    Populated by ``dispatch --dry-run`` only: the preview must name the failure
+    instead of listing the card as "would spawn" — the same diagnostic lie as
+    reporting a held workspace as free — while still writing nothing (no claim,
+    no ``spawn_failed`` event, no failure counter, no materialization).
+    Materialization failures (``mkdir``, ``git worktree add``) are spawn-time,
+    not resolution-time, and stay unseen: a dry run never touches the disk."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -2194,17 +2204,20 @@ def _dispatch_lane_task(
             workspace = _kbw.resolve_workspace(task, board=board, materialize=not dry_run)
     except Exception as exc:
         if dry_run:
-            # The preview models the workspace gate, not spawn-time failures: a
-            # path that cannot resolve would fail the real tick before spawning.
-            # Keep the historic "would spawn" verdict rather than inventing a
-            # failure bucket (and never write from a dry run).
+            # A REAL tick records ``spawn_failed`` here (and auto-blocks the
+            # card at ``failure_limit``); the preview must name that same
+            # failure rather than claim the card would spawn — reporting
+            # "would spawn" for a workspace that cannot resolve is the same
+            # diagnostic lie as reporting a held workspace as free.
+            # Preview only: no claim, no event, no failure counter, no
+            # materialization (the ticket deliberately does not predict the
+            # breaker; it only names the failure a real tick would record).
             _kb._log.debug(
-                "kanban dispatch --dry-run: cannot preview workspace for %s: %s",
+                "kanban dispatch --dry-run: workspace for %s would fail to resolve: %s",
                 task_id, exc,
             )
-            result.spawned.append((task_id, assignee, ""))
-            _count_spawn(assignee)
-            return True
+            result.skipped_workspace_unresolvable.append((task_id, str(exc)))
+            return False
         # No claim yet: nothing to release, but the attempt is still recorded
         # (event with a NULL run id, failure counter, breaker at the limit).
         if _record_task_failure(
