@@ -827,19 +827,34 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         )
 
 
-def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str) -> tuple[Path, str]:
-    """Materialize the canonical ``<repo>/.worktrees/<task-id>`` worktree."""
+def _anchored_worktree(
+    repo_root: Path, task_id: str, branch_name: str, *, materialize: bool = True,
+) -> tuple[Path, str]:
+    """Return the canonical ``<repo>/.worktrees/<task-id>`` worktree.
+
+    Materialized unless ``materialize=False``: the path is deterministic, so a
+    dispatch ``--dry-run`` preview needs no ``git worktree add`` side effect.
+    """
     target = repo_root / ".worktrees" / task_id
-    _ensure_git_worktree(repo_root, target, branch_name)
+    if materialize:
+        _ensure_git_worktree(repo_root, target, branch_name)
     return target, branch_name
 
 
-def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> tuple[Path, str]:
-    """Resolve + materialize a linked git worktree for ``task``. With no
-    ``task.workspace_path`` the anchor is the board's ``default_workdir`` so
-    every worktree lands under a board-owned repo (``<repo>/.worktrees/<id>``)
-    instead of the dispatcher's incidental CWD (whatever dir the gateway was
-    launched from); with no anchor configured we fail loudly rather than guess."""
+def _resolve_worktree_workspace(
+    task: Task, *, board: Optional[str] = None, materialize: bool = True,
+) -> tuple[Path, str]:
+    """Resolve a linked git worktree for ``task``, materializing it unless
+    ``materialize=False``. With no ``task.workspace_path`` the anchor is the
+    board's ``default_workdir`` so every worktree lands under a board-owned repo
+    (``<repo>/.worktrees/<id>``) instead of the dispatcher's incidental CWD
+    (whatever dir the gateway was launched from); with no anchor configured we
+    fail loudly rather than guess.
+
+    ``materialize=False`` computes the SAME path a real tick would use without
+    creating anything (no ``git worktree add``, no branch, no mkdir) — the
+    dispatch ``--dry-run`` preview of the one-workspace-one-writer gate.
+    """
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
     if not task.workspace_path:
         board_slug = board if board else _kb.get_current_board()
@@ -863,7 +878,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
                 f"task {task.id} has workspace_kind=worktree but board "
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
-        return _anchored_worktree(repo_root, task.id, branch_name)
+        return _anchored_worktree(repo_root, task.id, branch_name, materialize=materialize)
 
     requested = Path(task.workspace_path).expanduser()
     if not requested.is_absolute():
@@ -886,7 +901,8 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if _path_key(fallback.resolve(strict=False)) != _path_key(requested_resolved):
-                _ensure_git_worktree(fallback_root, fallback, branch_name)
+                if materialize:
+                    _ensure_git_worktree(fallback_root, fallback, branch_name)
                 return fallback.resolve(strict=False), branch_name
         # No repo to anchor a fallback on (or the occupied path IS this task's
         # own canonical worktree): keep the legacy reuse rather than fail dispatch.
@@ -894,7 +910,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and _path_key(requested_resolved) == _path_key(repo_root):
-        return _anchored_worktree(repo_root, task.id, branch_name)
+        return _anchored_worktree(repo_root, task.id, branch_name, materialize=materialize)
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
     if repo_root is None:
@@ -902,12 +918,15 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    _ensure_git_worktree(repo_root, requested, branch_name)
+    if materialize:
+        _ensure_git_worktree(repo_root, requested, branch_name)
     return requested, branch_name
 
 
-def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
-    """Resolve (and create if needed) the workspace for a task.
+def resolve_workspace(
+    task: Task, *, board: Optional[str] = None, materialize: bool = True,
+) -> Path:
+    """Resolve the workspace for a task, creating it unless ``materialize=False``.
 
     ``scratch``: ``<board-root>/workspaces/<id>/`` — path-stable across the
     dispatcher and every profile worker. ``dir``: ``workspace_path``, created
@@ -916,10 +935,14 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     worktree; a repo-root ``workspace_path`` anchors ``<repo>/.worktrees/<id>``,
     a concrete path is created/reused, none -> the board's ``default_workdir``
     (raises if unset rather than guessing). Persist via ``set_workspace_path``.
+
+    ``materialize=False`` computes the same path without any filesystem write
+    (no ``mkdir``, no ``git worktree add``); dispatch ``--dry-run`` uses it to
+    preview the one-workspace-one-writer gate without touching the disk.
     """
     kind = task.workspace_kind or "scratch"
     if kind == "worktree":
-        return _resolve_worktree_workspace(task, board=board)[0]
+        return _resolve_worktree_workspace(task, board=board, materialize=materialize)[0]
     if kind == "scratch" and not task.workspace_path:
         p = _kb.workspaces_root(board=board) / task.id
     elif kind == "scratch":
@@ -943,7 +966,8 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
             )
     else:
         raise ValueError(f"unknown workspace_kind: {kind}")
-    p.mkdir(parents=True, exist_ok=True)
+    if materialize:
+        p.mkdir(parents=True, exist_ok=True)
     return p
 
 

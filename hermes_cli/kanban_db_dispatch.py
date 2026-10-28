@@ -2161,25 +2161,40 @@ def _dispatch_lane_task(
         if per_profile_cap is not None and name:
             per_profile_running[name] = per_profile_running.get(name, 0) + 1
 
-    if dry_run:
-        result.spawned.append((task_id, assignee, ""))
-        _count_spawn(assignee)
-        return True
     # Resolve the workspace BEFORE claiming: the resolved path is what decides
     # whether this card may spawn at all (one workspace = one writer). Claiming
     # first would open a run row plus a ``claimed`` event on every tick a held
     # workspace defers the card. Resolution is deterministic per task id, so
     # doing it pre-claim does not change what the card would run in.
+    #
+    # ``--dry-run`` runs the SAME resolution with ``materialize=False``: it
+    # must not mkdir a scratch/dir path or ``git worktree add``. The gate is
+    # then evaluated exactly as a real tick would evaluate it, so the preview
+    # cannot report a held-workspace card as "would spawn" (the diagnostic lie
+    # operators read as "why is this ready card not spawning").
     task = _kb.get_task(conn, task_id)
     if task is None:
         return False
     try:
         resolved_branch_name = None
         if task.workspace_kind == "worktree":
-            workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(task, board=board)
+            workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(
+                task, board=board, materialize=not dry_run)
         else:
-            workspace = _kbw.resolve_workspace(task, board=board)
+            workspace = _kbw.resolve_workspace(task, board=board, materialize=not dry_run)
     except Exception as exc:
+        if dry_run:
+            # The preview models the workspace gate, not spawn-time failures: a
+            # path that cannot resolve would fail the real tick before spawning.
+            # Keep the historic "would spawn" verdict rather than inventing a
+            # failure bucket (and never write from a dry run).
+            _kb._log.debug(
+                "kanban dispatch --dry-run: cannot preview workspace for %s: %s",
+                task_id, exc,
+            )
+            result.spawned.append((task_id, assignee, ""))
+            _count_spawn(assignee)
+            return True
         # No claim yet: nothing to release, but the attempt is still recorded
         # (event with a NULL run id, failure counter, breaker at the limit).
         if _record_task_failure(
@@ -2196,6 +2211,9 @@ def _dispatch_lane_task(
     holder = _kbw.workspace_claim_holder(conn, task_id, workspace)
     if holder is not None:
         result.skipped_workspace_busy.append((task_id, str(workspace), holder))
+        if dry_run:
+            # Preview only: no claim, no event, no failure counter.
+            return False
         _kb._log.warning(
             "kanban dispatch: deferring %s — workspace %s is held by the live "
             "claim of %s", task_id, workspace, holder,
@@ -2212,6 +2230,12 @@ def _dispatch_lane_task(
             event_payload_extra={"workspace": str(workspace), "holder_task_id": holder},
         )
         return False
+    if dry_run:
+        # Preview only: no claim, no run row, no workspace writes. The reported
+        # path is the exact one a real tick would spawn into.
+        result.spawned.append((task_id, assignee, str(workspace)))
+        _count_spawn(assignee)
+        return True
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:

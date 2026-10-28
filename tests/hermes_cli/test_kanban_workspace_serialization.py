@@ -23,6 +23,7 @@ reason and spawns after release; it is never a failure.
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -483,3 +484,175 @@ def test_busy_deferral_records_one_event_across_ticks(tmp_path, monkeypatch):
     assert second not in spawn.ids
     assert kinds.count("workspace_busy") == 1, kinds
     assert still_ready is not None and still_ready.status == "ready"
+
+
+# ---------------------------------------------------------------------------
+# ``dispatch --dry-run`` previews the gate instead of lying about it
+# ---------------------------------------------------------------------------
+
+
+def _to_review(conn, task_id: str) -> None:
+    """Put a card in the review lane, exactly as an implementation handoff does."""
+    claimed = kb.claim_task(conn, task_id)
+    assert claimed is not None
+    assert kb.request_review(
+        conn, task_id, summary="ready", expected_run_id=claimed.current_run_id,
+    )
+
+
+def _dry_run_json(monkeypatch) -> dict:
+    """Run the real CLI ``dispatch --dry-run --json`` path and decode its output.
+
+    Patches only the two config-derived bounds (config file, memory-derived
+    concurrency default) so the tick's spawn budget is deterministic on any
+    host; everything else is the production dispatch path.
+    """
+    from hermes_cli import kanban as kc
+
+    monkeypatch.setattr("hermes_cli.config.load_config", dict)
+    monkeypatch.setattr(kbd, "resolve_max_in_progress", lambda configured: configured)
+    return json.loads(kc.run_slash("dispatch --dry-run --json"))
+
+
+def test_dry_run_reports_held_workspace_instead_of_would_spawn(tmp_path, monkeypatch):
+    """RED at 21da717a6f: the dry-run short-circuit preceded the gate.
+
+    The operator's documented "why is this ready card not spawning" command
+    must report a held workspace as deferred — exact shape from the incident:
+    A claimed/running on W, B ready on W, C in review on W.
+    """
+    _isolated_home(tmp_path, monkeypatch)
+    shared = tmp_path / "one-worktree"
+    shared.mkdir()
+    with kbc.connect() as conn:
+        holder = kb.create_task(
+            conn, title="holder", assignee="red",
+            workspace_kind="dir", workspace_path=str(shared),
+        )
+        second = kb.create_task(
+            conn, title="second", assignee="red",
+            workspace_kind="dir", workspace_path=str(shared),
+        )
+        reviewing = kb.create_task(
+            conn, title="reviewing", assignee="red",
+            workspace_kind="dir", workspace_path=str(shared),
+        )
+        _hold_claim(conn, holder)
+        _to_review(conn, reviewing)
+
+    payload = _dry_run_json(monkeypatch)
+    spawned = [row["task_id"] for row in payload["spawned"]]
+    assert second not in spawned, payload
+    assert reviewing not in spawned, payload
+    deferred = {
+        row["task_id"]: row["holder_task_id"]
+        for row in payload["skipped_workspace_busy"]
+    }
+    assert deferred == {second: holder, reviewing: holder}, payload
+
+    # The preview claims nothing and records nothing: a dry run must not stamp
+    # the deferral the real tick writes.
+    with kbc.connect() as conn:
+        rows = {tid: kb.get_task(conn, tid) for tid in (second, reviewing)}
+        kinds = {
+            tid: [e.kind for e in kb.list_events(conn, tid)]
+            for tid in (second, reviewing)
+        }
+    assert rows[second] is not None and rows[second].status == "ready"
+    assert rows[reviewing] is not None and rows[reviewing].status == "review"
+    for tid in (second, reviewing):
+        row = rows[tid]
+        assert row is not None, tid
+        assert row.claim_lock is None, tid
+        assert row.consecutive_failures == 0, tid
+        assert "workspace_busy" not in kinds[tid], kinds[tid]
+
+    # Control: a real tick makes the SAME call on this fixture, so the preview
+    # assertion above cannot pass on a broken fixture.
+    spawn = _Spawn()
+    with kbc.connect() as conn:
+        res = kbd.dispatch_once(conn, spawn_fn=spawn, reconcile_orphans=False)
+    assert spawn.ids == []
+    assert {tid for tid, _ws, _holder in res.skipped_workspace_busy} == {second, reviewing}
+
+
+def test_dry_run_previews_a_fresh_scratch_workspace_without_creating_it(tmp_path, monkeypatch):
+    """The preview resolves the path a real tick would use, but never mkdirs it."""
+    _isolated_home(tmp_path, monkeypatch)
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="fresh", assignee="red")
+    scratch = kb.workspaces_root() / tid
+    assert not scratch.exists(), "fixture already materialized the scratch workspace"
+
+    payload = _dry_run_json(monkeypatch)
+    row = next((r for r in payload["spawned"] if r["task_id"] == tid), None)
+    assert row is not None, payload
+    assert row["workspace"] == str(scratch), row
+    assert not scratch.exists(), "dispatch --dry-run materialized a scratch workspace"
+
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None and task.status == "ready"
+    assert task.claim_lock is None
+
+
+def test_worktree_preview_matches_real_path_without_creating_the_checkout(tmp_path, monkeypatch):
+    """``materialize=False`` must return the same path the real resolution uses.
+
+    A dry run must not run ``git worktree add``, but it still has to know the
+    path the gate compares or a held worktree would be invisible.
+    """
+    from hermes_cli import kanban_db_workspace as kbw
+
+    _isolated_home(tmp_path, monkeypatch)
+    repo = _make_repo(tmp_path)
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="wt", assignee="red",
+            workspace_kind="worktree", workspace_path=str(repo),
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+
+    preview, preview_branch = kbw._resolve_worktree_workspace(task, materialize=False)
+    assert preview_branch == f"wt/{tid}"
+    assert not (repo / ".worktrees" / tid).exists(), "preview materialized the worktree"
+
+    real, real_branch = kbw._resolve_worktree_workspace(task)
+    assert (preview, preview_branch) == (real, real_branch)
+    assert (repo / ".worktrees" / tid).exists()
+
+
+def test_create_help_states_the_real_workspace_default():
+    """Defect 2: help promised ``default: scratch``; the DB inherits a dir."""
+    from hermes_cli import kanban as kc
+
+    help_text = kc.run_slash("create --help")
+    assert "default: scratch" not in help_text.lower(), help_text
+    assert "inherit" in help_text.lower(), help_text
+
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(
+        [
+            "git", "-C", str(repo),
+            "-c", "user.name=Test User",
+            "-c", "user.email=test@example.com",
+            "-c", "commit.gpgsign=false",
+            *args,
+        ],
+        check=True, capture_output=True, text=True,
+    )
+
+
+def _make_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main", str(repo)],
+        check=True, capture_output=True, text=True,
+    )
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-m", "init")
+    return repo
