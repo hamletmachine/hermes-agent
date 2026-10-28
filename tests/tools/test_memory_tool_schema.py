@@ -30,3 +30,18 @@ def test_memory_schema_has_no_forbidden_top_level_combinators():
             "Codex backend (chatgpt.com/backend-api/codex). Per-action "
             "required-field checks belong in the runtime handler, not the schema."
         )
+
+
+def test_memory_schema_requires_payload_fields():
+    """The thinking DeepSeek variant drops optional arguments; require them.
+
+    A call that arrives without old_text/content is rejected at runtime, but the
+    model then tends to repeat the identical bare call. Schema-required fields
+    force the provider to emit them. Empty strings are allowed for actions that
+    do not use a field (add/remove); the runtime handler still validates real
+    patch/remove payloads.
+    """
+    params = MEMORY_SCHEMA["parameters"]
+    assert set(params["required"]) == {"target", "content", "old_text"}
+    item = params["properties"]["operations"]["items"]
+    assert set(item["required"]) == {"action", "content", "old_text"}
