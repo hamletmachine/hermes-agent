@@ -2263,11 +2263,24 @@ def _dispatch_lane_task(
         extra = {"workspace": str(workspace), "holder_task_id": holder}
         if workspace_claim.holder_board is not None:
             extra["holder_board"] = workspace_claim.holder_board
+        # A competing dispatcher can claim this row between the ready-list
+        # snapshot and this gate (the 02:55 red7 probe race). If that claim's
+        # owner is still alive it owns the run — closing or releasing it here
+        # would orphan a worker that is about to write. If the owner is dead,
+        # the claim is a leftover and must be released, or the card stays
+        # ``running`` with ``worker_pid=NULL`` until the 4h stale sweep.
+        release_claim = False
+        fresh = _kb.get_task(conn, task_id)  # the claim can land after our snapshot
+        if fresh is not None and fresh.status == "running":
+            if not _kbw.claim_lock_owner_dead(fresh.claim_lock):
+                return False
+            release_claim = True
         _record_task_failure(
             conn, task_id,
             f"workspace busy: held by the live claim of {holder}",
             outcome="workspace_busy", failure_limit=failure_limit,
-            infrastructure=True, dedupe_event=True, end_run=True,
+            infrastructure=True, dedupe_event=True,
+            release_claim=release_claim, end_run=True,
             event_payload_extra=extra,
         )
         return False

@@ -262,13 +262,38 @@ _LIVE_CLAIM_PREDICATE = (
     "status = 'running' AND claim_lock IS NOT NULL AND workspace_path IS NOT NULL"
 )
 _LIVE_CLAIM_PATHS_SQL = (
-    f"SELECT id, workspace_path FROM tasks WHERE id != ? AND {_LIVE_CLAIM_PREDICATE}"
+    f"SELECT id, workspace_path, claim_lock FROM tasks "
+    f"WHERE id != ? AND {_LIVE_CLAIM_PREDICATE}"
 )
 # Sibling boards mint their own ids, so the id being dispatched here can name a
 # different live task there. Do not exclude it.
 _LIVE_CLAIM_PATHS_ANY_SQL = (
-    f"SELECT id, workspace_path FROM tasks WHERE {_LIVE_CLAIM_PREDICATE}"
+    f"SELECT id, workspace_path, claim_lock FROM tasks WHERE {_LIVE_CLAIM_PREDICATE}"
 )
+
+
+def claim_lock_owner_dead(claim_lock: Optional[str]) -> bool:
+    """True when a host-local claim's owner process no longer exists.
+
+    A claim row outlives the process that wrote it whenever a dispatcher dies
+    between ``claim_task`` and ``spawn`` (or a test/second dispatcher claims a
+    card and exits). Treating that row as a live writer blocks the workspace
+    for ``dispatch_stale_timeout_seconds`` (4h) even though nothing can write.
+    Cross-host locks are always treated as live: liveness is not observable
+    from here, and a false "free" corrupts a real checkout.
+    """
+    lock = str(claim_lock or "")
+    prefix = _kb._host_prefix()
+    if not prefix or not lock.startswith(prefix):
+        return False
+    pid_text = lock[len(prefix):]
+    if not pid_text.isdigit():
+        return False
+    try:
+        from hermes_cli.kanban_db_dispatch import _pid_alive  # late: import cycle
+        return not _pid_alive(int(pid_text))
+    except Exception:
+        return False
 
 
 def workspace_identity(path: Path | str | None) -> Optional[str]:
@@ -309,6 +334,8 @@ def _claim_in_rows(
     rows: Iterable[sqlite3.Row], key: str, board: Optional[str]
 ) -> Optional[WorkspaceClaim]:
     for row in rows:
+        if claim_lock_owner_dead(row["claim_lock"]):
+            continue
         if workspace_identity(row["workspace_path"]) == key:
             return WorkspaceClaim("busy", row["id"], board)
     return None
