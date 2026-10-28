@@ -69,6 +69,48 @@ def _partial_exit(agent, messages, conversation_history, api_call_count, final_r
     }, "truncated", True)
 
 
+def _required_arg_specs(tools: Any) -> dict:
+    """``tool name -> (top-level required, operations-items required)`` from the
+    agent's tool definitions. A schema-required field the model omitted is a
+    generation defect (thinking models drop optional args, 2026-10-28): catching
+    it here routes the call through the same retry/recovery machinery as broken
+    JSON instead of executing a call the tool can only reject."""
+    specs: dict = {}
+    for definition in tools or ():
+        fn = definition.get("function") if isinstance(definition, dict) else None
+        if not isinstance(fn, dict):
+            continue
+        name, parameters = fn.get("name"), fn.get("parameters")
+        if not name or not isinstance(parameters, dict):
+            continue
+        top = parameters.get("required") if isinstance(parameters.get("required"), list) else []
+        properties = parameters.get("properties") if isinstance(parameters.get("properties"), dict) else {}
+        items = properties.get("operations") if isinstance(properties.get("operations"), dict) else {}
+        # ``operations`` is an array schema: the per-op required list lives one
+        # level down (``operations.items.required``).
+        item_schema = items.get("items") if isinstance(items, dict) and isinstance(items.get("items"), dict) else {}
+        items_required = item_schema.get("required") if isinstance(item_schema.get("required"), list) else []
+        if top or items_required:
+            specs[name] = (top, items_required)
+    return specs
+
+
+def _missing_required_args(spec: tuple, parsed: Any) -> list:
+    """Missing schema-required keys: top-level names, plus per-op entries for
+    ``operations`` batches (``operations[2]: old_text, content``)."""
+    if not spec or not isinstance(parsed, dict):
+        return []
+    top_required, items_required = spec
+    missing = [key for key in top_required if key not in parsed]
+    if items_required and isinstance(parsed.get("operations"), list):
+        for index, op in enumerate(parsed["operations"], 1):
+            if isinstance(op, dict):
+                op_missing = [key for key in items_required if key not in op]
+                if op_missing:
+                    missing.append(f"operations[{index}]: {', '.join(op_missing)}")
+    return missing
+
+
 def validate_tool_calls(
     agent: Any, assistant_message: Any, finish_reason: str, *, messages: list[dict[str, Any]],
     conversation_history: Any, api_call_count: int, effective_task_id: Any,
@@ -168,12 +210,22 @@ def validate_tool_calls(
             tc.function.arguments = "{}"
             continue
         try:
-            json.loads(args)
+            parsed_args = json.loads(args)
         except json.JSONDecodeError as e:
             # A mixed-batch invalid-name call never executes (error result later);
             # don't let its broken args trigger the whole-turn JSON retry.
             if not (_mixed_invalid_batch and tc.function.name not in valid_names):
                 invalid_json_args.append((tc.function.name, str(e)))
+            continue
+        missing = _missing_required_args(
+            _required_arg_specs(agent.tools).get(tc.function.name, ()), parsed_args)
+        if missing:
+            # Valid JSON, but the schema-required fields the provider demands are
+            # absent. Same recovery path as broken JSON: the tool would only
+            # reject the call, and a rejected call tends to repeat verbatim.
+            if not (_mixed_invalid_batch and tc.function.name not in valid_names):
+                invalid_json_args.append((tc.function.name, (
+                    "missing schema-required argument(s): " + ", ".join(missing))))
 
     if invalid_json_args:
         invalid_names = {n for n, _ in invalid_json_args}
@@ -204,7 +256,9 @@ def validate_tool_calls(
 
         agent._invalid_json_retries += 1
         tool_name, error_msg = invalid_json_args[0]
-        agent._buffer_vprint(f"⚠️  Invalid JSON in tool call arguments for '{tool_name}': {error_msg}")
+        _kind = "Missing schema-required argument(s)" if "missing schema-required" in error_msg \
+            else "Invalid JSON in tool call arguments"
+        agent._buffer_vprint(f"⚠️  {_kind} for '{tool_name}': {error_msg}")
 
         if agent._invalid_json_retries < 3:
             agent._buffer_vprint(f"🔄 Retrying API call ({agent._invalid_json_retries}/3)...")
