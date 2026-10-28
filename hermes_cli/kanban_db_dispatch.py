@@ -133,8 +133,8 @@ class DispatchResult:
     skipped_workspace_busy: list[tuple[str, str, str]] = field(default_factory=list)
     """``(task_id, workspace_path, holder_task_id)`` deferred because another
     live claim already holds that resolved workspace. One workspace = one
-    writer; the card stays ``ready`` and is picked up on the tick after the
-    holder's claim is released."""
+    writer; the card stays in its lane (``ready``, or ``review`` for a review
+    card) and is picked up on the tick after the holder's claim is released."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)

@@ -1,10 +1,22 @@
-"""One workspace = one writer: the dispatcher must serialize by resolved path.
+"""One workspace = one writer: creation inherits a shared dir, dispatch serializes it.
 
-Regression for the 2026-10-27 thread-truth collision: two cards whose resolved
-``workspace_path`` was the same worktree were claimed and spawned in the same
-second, and two workers wrote one checkout (a half-applied edit left
-``NameError`` in the tree).  A task whose resolved workspace is held by another
-live claim must stay in ``ready`` with a recorded reason, not spawn.
+Regression for the 2026-10-27 thread-truth collision.  RETRACTION of the first
+draft of this docstring: the colliding pair did **not** store the same
+``workspace_path``.  Board rows show review card ``t_7fb5b97c`` held
+``workspace_kind='dir'`` / ``/home/island/ideas/red7/.worktrees/thread-truth``,
+while duplicate FIX card ``t_b4ecddaf`` was created ``scratch`` with
+``workspace_path=NULL`` (its ``created`` event carries
+``creator_task_id=t_7fb5b97c``); run 209's own task prompt reads
+``Workspace: scratch @ .../workspaces/t_b4ecddaf`` and its tool calls
+``cd``-ed into ``.../thread-truth`` (msg 59515) and patched absolute paths
+there (msgs 59563/59588/59607).  A stored-path comparison alone would not
+have deferred it.
+
+Two mechanisms close the class: ``create_task`` inherits a ``dir`` creator's
+path for a card that names no workspace (``workspace_inherited_from`` on the
+``created`` event), and the dispatch gate defers any card whose RESOLVED
+workspace is held by another live claim.  A held card stays in its lane with a
+recorded reason and spawns after release; it is never a failure.
 """
 from __future__ import annotations
 
@@ -214,6 +226,99 @@ def test_busy_deferral_on_auth_shaped_path_still_spawns_after_release(tmp_path, 
         _release(conn, holder)
         res = kbd.dispatch_once(conn, spawn_fn=spawn, reconcile_orphans=False)
     assert [tid for tid, _w, _p in res.spawned] == [second]
+
+
+def test_child_created_without_workspace_inherits_creator_dir_and_defers(tmp_path, monkeypatch):
+    """The real incident shape: the duplicate card named no workspace at all.
+
+    ``t_b4ecddaf`` was created from review card ``t_7fb5b97c`` (``dir`` on the
+    thread-truth checkout) with no workspace, so it resolved to its own scratch
+    dir and the dispatcher could not see that its worker would edit the shared
+    checkout.  Inheritance must store the creator's ``dir`` path, defer the
+    child while the creator's claim is live, and spawn it after release.
+    """
+    _isolated_home(tmp_path, monkeypatch)
+    shared = tmp_path / "thread-truth"
+    shared.mkdir()
+    spawn = _Spawn()
+    with kbc.connect() as conn:
+        creator = kb.create_task(
+            conn, title="code review", assignee="red",
+            workspace_kind="dir", workspace_path=str(shared),
+        )
+        child = kb.create_task(
+            conn, title="fix", assignee="red", creator_task_id=creator,
+            body=f"edit bcn/lib/thread_truth.py under {shared}",
+        )
+        row = kb.get_task(conn, child)
+        created = [e for e in kb.list_events(conn, child) if e.kind == "created"]
+        _hold_claim(conn, creator)
+        res = kbd.dispatch_once(conn, spawn_fn=spawn, reconcile_orphans=False)
+        deferred = kb.get_task(conn, child)
+    assert row is not None
+    assert (row.workspace_kind, row.workspace_path) == ("dir", str(shared)), (
+        "child did not inherit the creator's dir; it would spawn into its own "
+        f"scratch dir while its instructions point at {shared}"
+    )
+    assert created and (created[0].payload or {}).get("workspace_inherited_from") == creator
+    assert child not in spawn.ids, spawn.calls
+    assert [tid for tid, _w, _p in res.skipped_workspace_busy] == [child]
+    assert res.skipped_workspace_busy[0][2] == creator
+    assert deferred is not None and deferred.status == "ready"
+    assert deferred.claim_lock is None and deferred.consecutive_failures == 0
+
+    # Control: the SAME child spawns once the creator's claim is released.
+    with kbc.connect() as conn:
+        _release(conn, creator)
+        res2 = kbd.dispatch_once(conn, spawn_fn=spawn, reconcile_orphans=False)
+    assert [tid for tid, _w, _p in res2.spawned] == [child]
+    assert spawn.calls == [(child, str(shared))]
+
+
+def test_explicit_child_workspace_wins_over_creator_dir(tmp_path, monkeypatch):
+    """An explicit workspace (or an explicit scratch opt-out) is never overridden."""
+    _isolated_home(tmp_path, monkeypatch)
+    shared = tmp_path / "thread-truth"
+    other = tmp_path / "somewhere-else"
+    shared.mkdir()
+    other.mkdir()
+    with kbc.connect() as conn:
+        creator = kb.create_task(
+            conn, title="review", assignee="red",
+            workspace_kind="dir", workspace_path=str(shared),
+        )
+        own_dir = kb.create_task(
+            conn, title="own dir", assignee="red", creator_task_id=creator,
+            workspace_kind="dir", workspace_path=str(other),
+        )
+        opt_out = kb.create_task(
+            conn, title="no shared checkout", assignee="red", creator_task_id=creator,
+            workspace_kind="scratch",
+        )
+        own_row = kb.get_task(conn, own_dir)
+        out_row = kb.get_task(conn, opt_out)
+    assert own_row is not None and (own_row.workspace_kind, own_row.workspace_path) == ("dir", str(other))
+    assert out_row is not None and (out_row.workspace_kind, out_row.workspace_path) == ("scratch", None)
+
+
+def test_worktree_creator_does_not_pass_its_checkout_down(tmp_path, monkeypatch):
+    """A worktree is per-task: a child must not inherit another task's checkout.
+
+    Sharing one would put two tasks on the first task's branch (the same rule
+    ``_insert_decomposed_child`` and ``_resolve_worktree_workspace`` enforce).
+    """
+    _isolated_home(tmp_path, monkeypatch)
+    checkout = tmp_path / "repo" / ".worktrees" / "t_creator"
+    checkout.mkdir(parents=True)
+    with kbc.connect() as conn:
+        creator = kb.create_task(
+            conn, title="worktree creator", assignee="red",
+            workspace_kind="worktree", workspace_path=str(checkout),
+        )
+        child = kb.create_task(conn, title="child", assignee="red", creator_task_id=creator)
+        row = kb.get_task(conn, child)
+    assert row is not None
+    assert (row.workspace_kind, row.workspace_path) == ("scratch", None)
 
 
 def test_busy_deferral_records_one_event_across_ticks(tmp_path, monkeypatch):

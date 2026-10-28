@@ -258,6 +258,41 @@ def workspace_claim_holder(
     return None
 
 
+def creator_workspace_inheritance(
+    conn: sqlite3.Connection, creator_task_id: Optional[str]
+) -> Optional[tuple[str, str]]:
+    """``(workspace_kind, workspace_path)`` a new card inherits from its creator.
+
+    Only a ``dir`` creator passes its path down. A ``dir`` workspace names an
+    existing, externally-owned checkout that the creating worker is already in,
+    so a card created from there is aimed at that same checkout; storing the
+    path is what lets :func:`workspace_claim_holder` serialize the child behind
+    the creator instead of spawning it into a private scratch dir the
+    dispatcher cannot correlate with the checkout the task body names
+    (2026-10-27 thread-truth: duplicate FIX card ``t_b4ecddaf`` was created
+    ``scratch``/NULL from review card ``t_7fb5b97c`` — ``dir`` = thread-truth —
+    spawned into its own scratch dir, and its worker ``cd``-ed into the shared
+    checkout from the task instructions, colliding with ``t_2fd4a827`` run 210).
+
+    ``worktree`` creators do NOT pass a path down: a worktree is per-task, and
+    both :func:`_resolve_worktree_workspace` and ``_insert_decomposed_child``
+    refuse to share one checkout across tasks (a sibling would land on the first
+    task's branch). ``scratch`` is ephemeral per-task storage by design. Returns
+    ``None`` when there is nothing safe to inherit.
+    """
+    if not creator_task_id:
+        return None
+    row = conn.execute(
+        "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+        (str(creator_task_id),),
+    ).fetchone()
+    if row is None or not row["workspace_path"]:
+        return None
+    if (row["workspace_kind"] or "scratch") != "dir":
+        return None
+    return "dir", row["workspace_path"]
+
+
 def _defer_shared_workspace_cleanup(
     conn: sqlite3.Connection, task_id: str, path: Path | str
 ) -> bool:
