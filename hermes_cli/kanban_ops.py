@@ -109,6 +109,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "workspace": ws, "holder_task_id": holder}
                 for (tid, ws, holder) in res.skipped_workspace_busy
             ],
+            "skipped_workspace_unresolvable": [
+                {"task_id": tid, "error": error}
+                for (tid, error) in res.skipped_workspace_unresolvable
+            ],
             "auto_assigned_default": res.auto_assigned_default,
             "respawn_guarded": [
                 {"task_id": tid, "reason": reason}
@@ -147,6 +151,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(f"Deferred ({who} at per-profile cap, {current} running): {tid}")
     for tid, ws, holder in res.skipped_workspace_busy:
         print(f"Deferred (workspace held by live run of {holder}): {tid} @ {ws}")
+    for tid, error in res.skipped_workspace_unresolvable:
+        print(f"Workspace unresolvable ({error}): {tid}")
     if res.skipped_nonspawnable:
         print(
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
