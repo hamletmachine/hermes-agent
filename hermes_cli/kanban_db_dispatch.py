@@ -1323,18 +1323,26 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 event_payload_extra={"pid": pid, "claimer": claimer, "terminal_provider": True},
             )
         else:
+            # The worker's owner refused the turn because the GATEWAY went away. That is a
+            # host event, not a card failure: charging it burns the card's retry budget for
+            # someone else's restart (2026-10-29: review card t_74e17583 lost its single
+            # retry to an operator restart, twice, and never produced a verdict).
+            gateway_drop = "gateway disconnected" in (error_text or "").lower()
             is_systemic = fp_counts.get(_error_fingerprint(error_text), 0) >= 3
             extra = {"pid": pid, "claimer": claimer}
-            if is_systemic:
+            if gateway_drop:
+                extra["infrastructure"] = True
+            if is_systemic and not gateway_drop:
                 # Trips at 1, below any ``failure_limit``: hold it for an operator.
                 extra["sticky"] = True
             tripped = _record_task_failure(
                 conn, tid,
                 error=error_text,
                 outcome="crashed",
-                failure_limit=1 if is_systemic else None,
+                failure_limit=1 if (is_systemic and not gateway_drop) else None,
                 release_claim=False,
                 end_run=False,
+                infrastructure=gateway_drop,
                 event_payload_extra=extra,
             )
         if tripped:
