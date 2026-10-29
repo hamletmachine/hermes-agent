@@ -349,7 +349,9 @@ def import_board(
         counts = _count_rows(conn)
 
     if activate:
-        kb.set_current_board(target)
+        from hermes_cli.kanban_boards import _persist_active_board
+
+        _persist_active_board(target)
 
     return {
         "board": target,
