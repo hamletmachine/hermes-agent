@@ -35,6 +35,9 @@ def test_worker_spawn_tags_session_source_kanban(monkeypatch, tmp_path):
         return _Proc()
 
     monkeypatch.setattr("subprocess.Popen", _fake_popen)
+    # This test asserts ENV tagging. The restart-safe scope wrapper is host topology and
+    # refuses a hand-built task with no current_run_id on a systemd-managed box.
+    monkeypatch.setattr(kbd, "_restart_safe_worker_argv", lambda task, command: command)
     monkeypatch.setattr(kbd, "_retag_legacy_worker_sessions", lambda _root: None)
     monkeypatch.setattr(kb, "worker_logs_dir", lambda board=None: tmp_path / "logs")
 
