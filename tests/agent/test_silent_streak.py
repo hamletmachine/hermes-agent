@@ -90,12 +90,15 @@ def test_flag_resets_per_turn():
 
 def test_finalize_gated_to_unattended_platforms():
     from agent.silent_streak import silent_streak_hard_end_eligible
-    for platform in ("cron", "kanban"):
+    for platform in ("cron",):
         agent = type("A", (), {"platform": platform, "max_iterations": 100})()
         for _ in range(60):
             note_round_visibility(agent, silent=True)
         assert silent_streak_hard_end_eligible(agent)
-    for platform in ("cli", "tui", "matrix", "telegram"):
+    # kanban joined this list 2026-10-29: a worker's contract is a TERMINAL call, so
+    # ending its turn for silence manufactured protocol violations (13 runs, 11 cards
+    # with crashed retries). The one-shot notice still applies there.
+    for platform in ("cli", "tui", "matrix", "telegram", "kanban"):
         agent = type("A", (), {"platform": platform, "max_iterations": 100})()
         for _ in range(60):
             note_round_visibility(agent, silent=True)

@@ -33,9 +33,19 @@ _N_RATIO = 0.15
 _N_MIN = 20
 _N_MAX = 60
 
-# Unattended platforms where a silent run must report progress and end: cron and
-# kanban (dispatcher-owned workers). Attended surfaces keep the notice-only tier.
-_HARD_END_PLATFORMS = frozenset({"cron", "kanban"})
+# Unattended platforms where a silent run must report progress and end.
+#
+# CRON ONLY — kanban was removed 2026-10-29. A kanban worker's contract is a
+# TERMINAL TOOL CALL (kanban_complete / kanban_request_review / kanban_block).
+# Ending its turn for silence cannot produce that call; it guarantees a run that
+# exits rc=0 without one, which the dispatcher books as a protocol violation and
+# retries - i.e. the checkpoint MANUFACTURED the crash class it was meant to
+# prevent. Measured on this box: 13 worker runs reached the finalize and 11 of
+# those cards carry crashed runs (t_f0c93a99 x6, t_736d0e16 x4, t_74e17583 x2).
+# A silent kanban worker is already bounded by max_iterations and the task's
+# max_runtime_seconds, and the one-shot NOTICE still tells it to checkpoint via
+# kanban_comment. Attended surfaces keep the notice-only tier.
+_HARD_END_PLATFORMS = frozenset({"cron"})
 
 SILENT_STREAK_NOTICE_TEMPLATE = (
     "[SYSTEM NOTICE — silent-streak checkpoint] You have run {count} iterations without any "
@@ -104,26 +114,14 @@ def silent_streak_checkpoint_due(agent: Any) -> bool:
 
 
 def silent_streak_hard_end_eligible(agent: Any) -> bool:
-    """Cron/kanban only: the streak reached the checkpoint AND the platform is an
-    unattended surface where a silent run must report instead of running on."""
+    """Cron only: the streak reached the checkpoint on an unattended surface that
+    has NO terminal-call contract. Kanban workers are excluded — see
+    ``_HARD_END_PLATFORMS`` for the measured reason."""
     _ensure_state(agent)
     if not should_finalize_silent_streak(agent):
         return False
     platform = str(getattr(agent, "platform", None) or "").strip().lower()
-    if platform not in _HARD_END_PLATFORMS:
-        return False
-    # A dispatcher-owned kanban worker context is the canonical kanban surface;
-    # platform alone can be unset for in-process cron fires, so accept the
-    # dispatcher context too.
-    if platform != "cron":
-        try:
-            from agent.delegation_context import is_dispatcher_owned_worker_context
-            if not (platform == "kanban" or is_dispatcher_owned_worker_context()):
-                return False
-        except Exception:
-            if platform != "kanban":
-                return False
-    return True
+    return platform in _HARD_END_PLATFORMS
 
 
 def reset_silent_streak_for_turn(agent: Any) -> None:
