@@ -17,16 +17,38 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
+def _hermes_modules() -> dict:
+    return {
+        name: mod for name, mod in sys.modules.items()
+        if name.startswith("hermes_cli") or name.startswith("hermes_state")
+        or name == "hermes_constants"
+    }
+
+
 @pytest.fixture()
 def isolated_kanban_home(monkeypatch):
-    """Spin up a fresh HERMES_HOME with a clean kanban DB."""
+    """Spin up a fresh HERMES_HOME with a clean kanban DB.
+
+    The purge below is required — hermes_cli bakes paths in at import time — but it MUST be
+    restored on teardown. Leaving the modules evicted (the 2026-10-29 bug) splits every class
+    and function into two identities: tests that already hold a reference keep the OLD
+    `hermes_cli.auth.AuthError` while a fresh import mints a NEW one, so `isinstance()` checks
+    silently fail and an unrelated test 3 files later dies with the wrong exit code. It also
+    broke every later `monkeypatch.setattr(<module>, ...)` against a stale module object.
+    Symptom in the aggregate suite: 25 failures that all pass standalone.
+    """
     test_home = tempfile.mkdtemp(prefix="kanban_cli_passthrough_")
     os.makedirs(os.path.join(test_home, "profiles", "default"), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
+    saved = _hermes_modules()
+    for mod in list(saved):
+        del sys.modules[mod]
+    try:
+        yield test_home
+    finally:
+        for mod in list(_hermes_modules()):
             del sys.modules[mod]
-    yield test_home
+        sys.modules.update(saved)
 
 
 def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, monkeypatch):
