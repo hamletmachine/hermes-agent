@@ -421,6 +421,7 @@ def creator_workspace_inheritance(
     workspace_kind: Optional[str] = None,
     workspace_path: Optional[str] = None,
     branch_name: Optional[str] = None,
+    born_in_triage: bool = False,
 ) -> Optional[tuple[str, str, Optional[str]]]:
     """``(workspace_kind, workspace_path, branch_name)`` a new card inherits.
 
@@ -470,6 +471,15 @@ def creator_workspace_inheritance(
         return None
     kind = row["workspace_kind"] or "scratch"
     if kind == "dir":
+        # A card born in ``triage`` is a PROPOSAL: the decomposer decides its
+        # children's workspaces anyway, so pinning the creator's checkout to it
+        # just propagates a shared (often LIVE) tree into auto-spawned work.
+        # 2026-10-29: a reviewer running in the live red7 checkout filed a triage
+        # follow-up; it inherited that path and auto_decompose put three workers
+        # in production code mid-acceptance. Worktree inheritance stays allowed —
+        # a worktree is already isolated.
+        if born_in_triage:
+            return None
         return "dir", row["workspace_path"], None
     if kind == "worktree":
         branch = (row["branch_name"] or "").strip() or f"wt/{creator_task_id}"

@@ -1246,6 +1246,7 @@ def create_task(
     inherited = creator_workspace_inheritance(
         conn, creator_task_id,
         workspace_kind=workspace_kind, workspace_path=workspace_path, branch_name=branch_name,
+        born_in_triage=bool(triage),
     )
     if inherited is not None:
         workspace_kind, workspace_path, branch_name = inherited
