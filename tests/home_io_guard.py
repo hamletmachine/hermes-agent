@@ -100,6 +100,13 @@ class HomeIOGuard:
                 return
             resolved = self._refuse_installed_app_change(value, absolute) if destructive else None
             roots = tuple(_normcase(os.fspath(r)) for r in self.roots())
+            # The install payload's manifest is dependency-BOOTSTRAP metadata, not Hermes
+            # state: ``hermes_bootstrap.activate_dependencies`` reads it on import to pick the
+            # interpreter generation. Without this, any test that imports ``gateway.run``
+            # (dispatcher, worker-scope, spawn paths) is refused before it can run. One exact
+            # file per root — no directory, no glob, and every real state file stays refused.
+            if any(absolute == root + os.sep + "manifest.json" for root in roots):
+                return
             # Resolving the root itself (get_default_hermes_root's relative_to
             # probe) reads no state; only its contents are guarded.
             if metadata and absolute in roots:

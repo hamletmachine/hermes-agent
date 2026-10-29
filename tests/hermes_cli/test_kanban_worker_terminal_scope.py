@@ -56,6 +56,11 @@ def _spawn_env_for_profile_b(monkeypatch, tmp_path):
         raise _StopSpawn
 
     monkeypatch.setattr(process_registry, "systemd_user_bus_env", _capture)
+    # Topology, not credentials: on a systemd-managed host _restart_safe_worker_argv refuses a
+    # task with no current_run_id (an untraceable worker). These fixtures build the Task by hand
+    # and only care about the ENV it receives, so bypass the scope wrapper.
+    monkeypatch.setattr(
+        kanban_db_dispatch, "_restart_safe_worker_argv", lambda task, command: command)
 
     task = Task(
         id="t1", title="t", body=None, assignee="b", status="claimed", priority=0,
@@ -95,6 +100,11 @@ def test_launch_profiles_own_worker_keeps_its_credentials(tmp_path, monkeypatch)
         raise _StopSpawn
 
     monkeypatch.setattr(process_registry, "systemd_user_bus_env", _capture)
+    # Topology, not credentials: on a systemd-managed host _restart_safe_worker_argv refuses a
+    # task with no current_run_id (an untraceable worker). These fixtures build the Task by hand
+    # and only care about the ENV it receives, so bypass the scope wrapper.
+    monkeypatch.setattr(
+        kanban_db_dispatch, "_restart_safe_worker_argv", lambda task, command: command)
     task = Task(
         id="t1", title="t", body=None, assignee="default", status="claimed", priority=0,
         created_by=None, created_at=0, started_at=None, completed_at=None,

@@ -696,6 +696,10 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
         return FakeProc()
 
     monkeypatch.setattr("subprocess.Popen", fake_popen)
+    # This test asserts the ARGV (no auto-loaded --skills). The restart-safe scope wrapper is
+    # topology-dependent and refuses a task with no current_run_id on a systemd-managed host;
+    # bypass it so the test exercises argv building, not host topology.
+    monkeypatch.setattr(kbd, "_restart_safe_worker_argv", lambda task, command: command)
 
     conn = kbc.connect()
     try:
