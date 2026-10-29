@@ -3175,6 +3175,32 @@ def edit_task(
     return True
 
 
+def _terminate_orphaned_block_worker(
+    conn: sqlite3.Connection, task_id: str, orphan: dict, run_id: Optional[int],
+) -> None:
+    """Signal the live worker an EXTERNAL block just orphaned, and record it.
+
+    ``block_task`` clears ``claim_lock``/``worker_pid`` before this runs, which is
+    exactly what makes ``reclaim_task`` refuse the row afterwards — so this is the
+    only remaining chance to stop the process. The dispatcher's reclaim helper is
+    reused (not copied) so the PID-recycle fingerprint has ONE owner; it also
+    refuses non-host-local claims and UNVERIFIED spawns on its own.
+
+    The import is local because ``kanban_db_dispatch`` imports this module.
+    """
+    from hermes_cli.kanban_db_dispatch import _terminate_reclaimed_worker
+
+    info = _terminate_reclaimed_worker(
+        orphan["pid"], orphan["claim_lock"], started_at=orphan["started_at"],
+    )
+    with write_txn(conn):
+        _append_event(
+            conn, task_id, "worker_terminated",
+            {"pid": orphan["pid"], "source": "external_block", **info},
+            run_id=run_id,
+        )
+
+
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
@@ -3195,12 +3221,30 @@ def block_task(
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
+    orphan: Optional[dict] = None
+    in_dependency_lane = False
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
+            "SELECT status, block_kind, block_recurrences, worker_pid, "
+            "       worker_started_at, claim_lock FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if cur_row is None:
             return False
+        # An EXTERNAL block (the caller asserts no run ownership) of a live worker
+        # must not orphan the process: the UPDATE below clears claim_lock/worker_pid,
+        # which also makes ``reclaim_task`` refuse the row afterwards — leaving a
+        # worker that keeps writing files while the card reads ``blocked`` and every
+        # correction path declines it (2026-10-29, red7 t_bbb998f0). Capture the
+        # identity here; signal only AFTER the txn commits (a signal inside the write
+        # txn can land on a worker waiting for the same lock).
+        if cur_row["status"] == "running" and expected_run_id is None:
+            _orphan_pid = _row_get(cur_row, "worker_pid")
+            if _orphan_pid:
+                orphan = {
+                    "pid": int(_orphan_pid),
+                    "claim_lock": _row_get(cur_row, "claim_lock"),
+                    "started_at": _row_get(cur_row, "worker_started_at"),
+                }
         # The breaker (``_record_task_failure``) parks cards ``blocked`` with no
         # ``block_kind`` and no ``blocked`` event -- the policy is the
         # supervisor's, not the kernel's -- but the transition guard below only
@@ -3261,10 +3305,14 @@ def block_task(
         )
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
         blocked_task = get_task(conn, task_id)
-        if kind == "dependency":
+        in_dependency_lane = kind == "dependency"
+        if in_dependency_lane:
             # Historical ordering: the dependency lane fires inside the txn.
             _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
-            return True
+    if orphan is not None:
+        _terminate_orphaned_block_worker(conn, task_id, orphan, run_id)
+    if in_dependency_lane:
+        return True
     _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
     return True
 
