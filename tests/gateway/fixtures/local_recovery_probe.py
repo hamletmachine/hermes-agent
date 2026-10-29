@@ -52,7 +52,18 @@ CHILD_ENV_KEYS = ('PATH', 'LANG', 'TZ', 'SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR', '
 
 
 def child_env():
-    return {k: os.environ[k] for k in CHILD_ENV_KEYS if k in os.environ}
+    env = {k: os.environ[k] for k in CHILD_ENV_KEYS if k in os.environ}
+    # A test-spawned Hermes must never install dependencies. The suite sets this
+    # kill-switch for itself (tests/conftest.py, before any module import), but a
+    # rebuilt child env drops it, and `gateway.run` then takes the launch-prep
+    # path: a checkout's isolated HERMES_HOME has no install state of its own, so
+    # every daemon boot syncs a full dependency environment into the test's temp
+    # home (~945 MB per invocation, measured on test_real_dispatcher_lifecycle)
+    # and can time out before the daemon is ready. Pass it through when the
+    # caller sets it; a test that needs installs unsets it (monkeypatch.delenv).
+    if os.environ.get('HERMES_DISABLE_LAZY_INSTALLS'):
+        env['HERMES_DISABLE_LAZY_INSTALLS'] = os.environ['HERMES_DISABLE_LAZY_INSTALLS']
+    return env
 
 
 async def rpc(ws, method, **params):
