@@ -84,7 +84,7 @@ def _cmd_boards_create(args: argparse.Namespace) -> int:
           f"  Display name: {meta.get('name', '')}\n"
           f"  DB path:      {meta['db_path']}")
     if getattr(args, "switch", False):
-        kb.set_current_board(meta["slug"])
+        _persist_active_board(meta["slug"])
         print(f"  Switched to {meta['slug']!r}.")
     else:
         print(f"  Use `hermes kanban boards switch {meta['slug']}` to make it current.")
@@ -109,6 +109,34 @@ def _cmd_boards_rm(args: argparse.Namespace) -> int:
     return 0
 
 
+def _persist_active_board(slug: str) -> None:
+    """Persist the active board where resolution reads it.
+
+    ``get_current_board()`` consults the ACTIVE PROFILE's ``kanban.default_board``
+    before the shared ``<root>/kanban/current`` file (the per-profile-default
+    landing), so a shared-file-only write prints success and is silently ignored
+    whenever that key is set — every fleet profile sets it. Write the key through
+    ``atomic_config_write`` into ``get_config_path()``, which follows the
+    context-local home override at call time (never the launch home). The payload
+    is the raw user config, so existing keys and ruamel comments survive and no
+    defaults materialize into the file.
+    """
+    from hermes_cli.config import (
+        atomic_config_write,
+        get_config_path,
+        read_user_config_raw,
+    )
+
+    kb._assert_not_delegated_child_mutation()
+    path = get_config_path()
+    data = read_user_config_raw(path)
+    kanban = data.get("kanban")
+    kanban = dict(kanban) if isinstance(kanban, dict) else {}
+    kanban["default_board"] = slug
+    data["kanban"] = kanban
+    atomic_config_write(path, data)
+
+
 def _cmd_boards_switch(args: argparse.Namespace) -> int:
     normed, rc = _board_slug_arg(args, "switch", must_exist=False)
     if rc:
@@ -122,7 +150,7 @@ def _cmd_boards_switch(args: argparse.Namespace) -> int:
     # `current` at a dead slug (#43243).
     if kb.read_board_metadata(normed).get("archived"):
         return _err(f"kanban boards switch: board {normed!r} is archived.")
-    kb.set_current_board(normed)
+    _persist_active_board(normed)
     print(f"Active board is now {normed!r}.")
     return 0
 
