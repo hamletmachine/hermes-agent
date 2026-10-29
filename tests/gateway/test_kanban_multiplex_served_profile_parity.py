@@ -63,6 +63,9 @@ def test_worker_for_served_profile_gets_its_own_env_and_toolset_pin(served, monk
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     monkeypatch.setattr(kbd, "_open_worker_log", lambda task, board: open("/dev/null", "w"))
     monkeypatch.setattr(kbd, "_hermes_argv", lambda: ["hermes"], raising=False)
+    # Host topology: the restart-safe scope wrapper refuses a run-less Task on a
+    # systemd-managed box; this test asserts the ENV/argv the worker receives.
+    monkeypatch.setattr(kbd, "_restart_safe_worker_argv", lambda task, command: command)
     kbd._default_spawn(task, str(served.alpha), board=None)
 
     env = spawned["env"]

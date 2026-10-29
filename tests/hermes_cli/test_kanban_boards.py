@@ -293,6 +293,10 @@ class TestWorkerSpawnEnv:
             return FakeProc()
 
         monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        # Host topology, not this test's subject: on a systemd-managed box the restart-safe
+        # scope wrapper refuses a hand-built Task with no current_run_id.
+        from hermes_cli import kanban_db_dispatch as _kbd
+        monkeypatch.setattr(_kbd, "_restart_safe_worker_argv", lambda task, command: command)
         kb.create_board("spawntest")
 
         task = kb.Task(
