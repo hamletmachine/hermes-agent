@@ -3188,9 +3188,31 @@ def _terminate_orphaned_block_worker(
     refuses non-host-local claims and UNVERIFIED spawns on its own.
 
     The import is local because ``kanban_db_dispatch`` imports this module.
+
+    TWO OWNERS, BY DESIGN — read before "simplifying" this away. The dispatcher's
+    ``reap_terminal_workers`` also ends a worker that outlived its closed run: it
+    runs from the reclaim phase of ``dispatch_once``, keys on
+    ``task_runs.worker_pid`` + fingerprint, and only after
+    ``TERMINAL_WORKER_REAP_GRACE_SECONDS``. This helper kills IMMEDIATELY and
+    without a dispatcher tick, which is why it exists; the reaper then sees a dead
+    pid and clears the evidence. That evidence clear is deliberately left to the
+    reaper — the pid lifecycle on ``task_runs`` has one owner, and this function
+    must not pre-empt it.
+
+    UNKNOWN, stated so nobody fills it in: why the 2026-10-29 incident
+    (``t_bbb998f0``) survived ~6 minutes is NOT established. The reaper is not
+    broken — this board carries reaped-worker events — but whether the dispatcher
+    ticked during that acceptance run is not recorded (the gateway logs a
+    dispatcher line only when a tick changes something), and the incident run's
+    ``task_runs.worker_pid`` is now NULL, which the reaper's own evidence clear
+    also produces. Do not cite that incident as proof the reaper fails.
     """
     from hermes_cli.kanban_db_dispatch import _terminate_reclaimed_worker
 
+    if int(orphan["pid"]) == os.getpid():
+        # Same defence the dispatcher's row reaper carries: never signal the
+        # process running this code.
+        return
     info = _terminate_reclaimed_worker(
         orphan["pid"], orphan["claim_lock"], started_at=orphan["started_at"],
     )
@@ -3311,7 +3333,15 @@ def block_task(
             # Historical ordering: the dependency lane fires inside the txn.
             _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
     if orphan is not None:
-        _terminate_orphaned_block_worker(conn, task_id, orphan, run_id)
+        # The block has already committed: a signalling failure must not swallow
+        # the blocked hook below, and the reaper is still a backstop.
+        try:
+            _terminate_orphaned_block_worker(conn, task_id, orphan, run_id)
+        except Exception:
+            _log.warning(
+                "kanban: block committed but terminating the orphaned worker of %s "
+                "(pid %s) failed", task_id, orphan.get("pid"), exc_info=True,
+            )
     if in_dependency_lane:
         return True
     _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)

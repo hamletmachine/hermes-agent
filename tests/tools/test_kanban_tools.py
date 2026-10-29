@@ -723,6 +723,7 @@ def test_create_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_create({
         "title": "child task",
+        "body": "child task — spec (cross-profile card now requires one)",
         "assignee": "peer",
         "parents": [worker_env],
     })
@@ -763,7 +764,7 @@ def test_create_explicit_scratch_ignores_ambient_board_project(
 
     def create(**extra):
         result = json.loads(kt._handle_create(
-            {"board": "target", "title": "card", "assignee": "peer", **extra}))
+            {"board": "target", "title": "card", "body": "card spec", "assignee": "peer", **extra}))
         assert result["ok"] is True
         return result["workspace_kind"], result["project_id"]
 
@@ -877,6 +878,7 @@ def test_worker_lifecycle_through_tools(worker_env):
     # 4. spawn a child task for follow-up
     child_out = json.loads(kt._handle_create({
         "title": "write integration test",
+        "body": "write integration test — spec (cross-profile card now requires one)",
         "assignee": "qa",
         "parents": [worker_env],
     }))
@@ -1118,6 +1120,7 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
 
     out = kt._handle_create({
         "title": "auto-sub gateway",
+        "body": "auto-sub gateway — spec (cross-profile card now requires one)",
         "assignee": "peer",
     })
     d = json.loads(out)
@@ -1152,6 +1155,7 @@ def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
 
     out = kt._handle_create({
         "title": "auto-sub tui",
+        "body": "auto-sub tui — spec (cross-profile card now requires one)",
         "assignee": "peer",
     })
     d = json.loads(out)
@@ -1178,6 +1182,7 @@ def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
 
     out = kt._handle_create({
         "title": "no sub cli",
+        "body": "no sub cli — spec (cross-profile card now requires one)",
         "assignee": "peer",
     })
     d = json.loads(out)
@@ -1212,6 +1217,7 @@ def test_create_tui_subscription_binds_to_live_session_after_compaction_fork(mon
 
     out = kt._handle_create({
         "title": "auto-sub tui post-fork",
+        "body": "auto-sub tui post-fork — spec (cross-profile card now requires one)",
         "assignee": "peer",
     })
     d = json.loads(out)
@@ -1284,6 +1290,7 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
     from tools import kanban_tools as kt
     out = kt._handle_create({
         "title": "no sub gated",
+        "body": "no sub gated — spec (cross-profile card now requires one)",
         "assignee": "peer",
     })
     d = json.loads(out)
@@ -1311,6 +1318,7 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
 
     out = kt._handle_create({
         "title": "auto-sub tolerates add_notify_sub failure",
+        "body": "auto-sub tolerates add_notify_sub failure — spec (cross-profile card now requires one)",
         "assignee": "peer",
     })
     d = json.loads(out)
@@ -1681,3 +1689,62 @@ def test_unblock_resets_review_round_budget(monkeypatch, tmp_path):
     fresh = json.loads(kt._handle_request_changes({"reason": "third"}))
     assert fresh.get("ok"), fresh
     assert fresh.get("status") == "ready"
+
+
+# ---------------------------------------------------------------------------
+# Create-time guards (2026-10-29): no title-only cards, no silent cross-profile scratch
+# ---------------------------------------------------------------------------
+
+def test_create_rejects_a_title_only_card(worker_env):
+    """An empty body dispatches a worker with no spec (red7 t_9e32563b)."""
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_create({"title": "empty", "assignee": "other-profile"}))
+    assert out.get("error"), out
+    assert "BODY" in out["error"]
+
+
+def test_create_allows_triage_without_a_body(worker_env):
+    """triage=true is the sanctioned "specifier writes it" path — but the workspace must be named."""
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_create({
+        "title": "proposal", "assignee": "other-profile",
+        "triage": True, "workspace_kind": "scratch",
+    }))
+    assert out.get("ok") is True, out
+
+
+def test_create_flags_a_defaulted_scratch_workspace(worker_env):
+    """Nothing inheritable + no workspace named = the worker starts in an unrelated scratch dir.
+
+    LOUD, not blocking: the response says so and the card carries a comment (red7 t_9e32563b).
+    """
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_create({
+        "title": "follow-up", "assignee": "other-profile", "body": "defect + acceptance",
+    }))
+    assert out.get("ok") is True, out
+    assert out.get("workspace_defaulted") is True, out
+
+
+def test_create_explicit_scratch_is_not_flagged(worker_env):
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_create({
+        "title": "follow-up", "assignee": "other-profile", "body": "defect + acceptance",
+        "workspace_kind": "scratch",
+    }))
+    assert out.get("ok") is True, out
+    assert out.get("workspace_defaulted") is False, out
+
+
+def test_create_same_profile_card_still_needs_no_workspace(worker_env):
+    """Control: the guard must not touch a worker fanning out to itself."""
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_create({
+        "title": "same profile", "assignee": "test-worker", "body": "defect + acceptance",
+    }))
+    assert out.get("ok") is True, out

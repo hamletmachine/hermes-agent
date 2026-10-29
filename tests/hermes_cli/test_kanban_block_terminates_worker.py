@@ -100,3 +100,53 @@ def test_self_block_does_not_signal_the_owning_worker(kanban_home: Path) -> None
 
         child.kill()
         child.wait(timeout=10)
+
+
+def test_termination_failure_still_fires_the_blocked_hook(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The block commits before the signal: a failed kill must not swallow the hook.
+
+    Otherwise the card reads ``blocked`` with no ``kanban_task_blocked`` wake, and
+    the operator never learns it needs attention.
+    """
+    fired: list[str] = []
+    monkeypatch.setattr(kb, "_fire_task_hook", lambda event, *a, **kw: fired.append(event))
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("signal path exploded")
+
+    monkeypatch.setattr(kb, "_terminate_orphaned_block_worker", _boom)
+
+    with kbc.connect_closing() as conn:
+        tid, _claimed, child = _running_task_with_live_worker(conn)
+        try:
+            assert kb.block_task(conn, tid, reason="operator park", kind="needs_input")
+            task = kb.get_task(conn, tid)
+            assert task is not None and task.status == "blocked"
+            assert "kanban_task_blocked" in fired, "blocked hook was swallowed by the kill failure"
+            assert not _worker_terminated_events(conn, tid)
+        finally:
+            child.kill()
+            child.wait(timeout=10)
+
+
+def test_external_block_never_signals_its_own_pid(kanban_home: Path) -> None:
+    """A self-pid worker row (dashboard/CLI acting as its own worker) is not signalled."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        fingerprint = kbd._process_fingerprint(os.getpid())
+        assert fingerprint is not None
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET worker_pid = ?, worker_started_at = ?, claim_lock = ? WHERE id = ?",
+                (os.getpid(), fingerprint, f"{kb._host_prefix()}:{os.getpid()}", tid),
+            )
+
+        assert kb.block_task(conn, tid, reason="operator park", kind="needs_input")
+
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert not _worker_terminated_events(conn, tid), "block signalled the process running the block"

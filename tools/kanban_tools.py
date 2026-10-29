@@ -1218,6 +1218,27 @@ def _handle_create(args: dict, **kw) -> str:
     triage, skills, goal_mode = (
         _parse_bool_arg(args, "triage"), _coerce_str_list(args.get("skills"), "skills", "skill names"),
         _parse_bool_arg(args, "goal_mode"))
+    # A title-only card is a work order with no spec: the dispatcher will spawn a worker holding
+    # nothing but that title (2026-10-29: an empty-bodied follow-up was dispatched into a scratch
+    # dir that could not reach the repo it was meant to patch — the worker either flails or edits
+    # outside its workspace). Either write the spec, or say you want one written.
+    _body_raw = args.get("body")
+    _body_text = _body_raw.strip() if isinstance(_body_raw, str) else ""
+    # Only CROSS-PROFILE work orders need the body: a worker fanning out to its own profile is
+    # usually a mechanical split the title fully describes, while a card handed to a DIFFERENT
+    # profile with no body is a work order nobody can execute (2026-10-29: an empty-bodied
+    # follow-up from a review run was dispatched into a scratch dir that could not reach the repo
+    # its title referenced). triage=true is the sanctioned "specifier writes it" path.
+    _creator_prof = (os.environ.get("HERMES_PROFILE") or "").strip()
+    _cross_profile = bool(_creator_prof) and str(assignee).strip() != _creator_prof
+    _check(
+        _body_text or triage or not _cross_profile,
+        "kanban_create: a card for another profile needs a BODY — state the defect/aim, the "
+        "acceptance criterion, and the check that proves it. A title-only cross-profile card "
+        "dispatches a worker with no spec (2026-10-29: an empty-bodied follow-up was dispatched "
+        "into a scratch dir it could not relate to the repo in its title). If the spec is not "
+        "yours to write, pass triage=true and a specifier will write it before dispatch.",
+    )
     model_override, provider_override = args.get("model"), args.get("provider")
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
@@ -1238,6 +1259,21 @@ def _handle_create(args: dict, **kw) -> str:
         if project_id is None and workspace_kind is None and workspace_path is None:
             if self_task is not None and self_task.project_id:
                 project_id, project_source_task_id = self_task.project_id, self_task.id
+        # A worker fanning work out to ANOTHER profile with no workspace named used to leave the
+        # child in a fresh scratch dir: a scratch creator has no checkout to inherit, so the child
+        # could not reach the tree its spec is about (2026-10-29: a reviewer's core-code follow-up
+        # was dispatched into an empty scratch dir). Cross-profile fan-out must therefore NAME the
+        # workspace — `workspace_kind="scratch"` is still fine, it just has to be an explicit
+        # decision instead of a silent default.
+        _creator_is_scratch = self_task is None or (self_task.workspace_kind or "scratch") == "scratch"
+        # LOUD, not blocking: cross-profile fan-out from a scratch creator leaves the child in an
+        # unrelated empty dir (2026-10-29). Refusing outright would break the documented fan-out
+        # surface, so the response says so and the card carries an event a reviewer can see.
+        _workspace_defaulted = bool(
+            self_tid is not None
+            and workspace_kind is None and workspace_path is None and project_id is None
+            and _creator_is_scratch
+        )
         new_tid = kb.create_task(
             conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
             parents=tuple(parents), tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
@@ -1258,8 +1294,15 @@ def _handle_create(args: dict, **kw) -> str:
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
+        if _workspace_defaulted:
+            kb.add_comment(
+                conn, new_tid, author="kanban", body=("workspace defaulted to scratch: the creating worker has no checkout to pass "
+                      "on. If this card edits a repo, its worker starts in an empty dir — name the "
+                      "tree with workspace_kind=\"dir\"/\"worktree\" + path, or ignore for scratch work."),
+            )
         return _ok(task_id=new_tid, **landed, **gate,
-                   subscribed=_maybe_auto_subscribe(conn, new_tid, board=args.get("board")))
+                   subscribed=_maybe_auto_subscribe(conn, new_tid, board=args.get("board")),
+                   workspace_defaulted=_workspace_defaulted)
 
 
 def _live_tui_session_key(session_key: str, profile: Optional[str]) -> str:

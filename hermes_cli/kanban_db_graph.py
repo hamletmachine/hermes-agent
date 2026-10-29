@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from pathlib import Path
 from typing import Any, Optional
 
 def inherit_creator_origin(
@@ -166,6 +167,41 @@ def decompose_triage_task(
     return child_ids
 
 
+def _decompose_repo_anchor(root_row: sqlite3.Row) -> Optional[str]:
+    """Absolute git repo a triage root's children can be worktreed onto.
+
+    Tried at decompose time, because dispatch fails a pathless worktree LOUDLY
+    (``skipped_workspace_unresolvable``) when no anchor exists — a child nobody
+    can dispatch is worse than a scratch child.
+
+    Order: the root's own ``dir`` path first (it names the CODEBASE the card is
+    about) and the board's ``default_workdir`` second (the anchor dispatch
+    itself uses for a pathless worktree). Either may be an ordinary checkout:
+    the worktree is materialized under ``<repo>/.worktrees/<child-id>``, so the
+    live working tree is never written to.
+    """
+    from hermes_cli import kanban_db as _kb
+    from hermes_cli.kanban_db_workspace import _git_toplevel
+
+    candidates: list[str] = []
+    root_path = str(root_row["workspace_path"] or "").strip()
+    if root_path:
+        candidates.append(root_path)
+    # ``read_board_metadata`` never raises (missing/malformed board.json yields
+    # the synthesized entry), so no guard is needed here.
+    board_default = str(_kb.read_board_metadata().get("default_workdir") or "").strip()
+    if board_default:
+        candidates.append(board_default)
+    for candidate in candidates:
+        path = Path(candidate).expanduser()
+        if not path.is_absolute():
+            continue
+        repo = _git_toplevel(path)
+        if repo is not None:
+            return str(repo)
+    return None
+
+
 def _insert_decomposed_child(
     conn: sqlite3.Connection, root_id: str, root_row: sqlite3.Row, child: dict,
     author: Optional[str], now: int,
@@ -179,6 +215,16 @@ def _insert_decomposed_child(
     and one shared checkout would put them all on the first sibling's branch
     with no lock; leaving it unset makes dispatch materialize a fresh
     ``<repo>/.worktrees/<child-id>`` per child from the board anchor.
+
+    A ``dir`` is NEVER inherited while the root sits in ``triage``. That path
+    is a SHARED, often LIVE checkout, and a card reaches triage from
+    ``ready``/``todo`` too (block-loop breaker, ``kanban_transfer``, a manual
+    move) — ``creator_workspace_inheritance``'s ``born_in_triage`` refusal only
+    covers cards created there. Such a child gets an isolated workspace
+    instead: a worktree anchored on the repo the root's path belongs to (or the
+    board's), else ``scratch``. Tradeoff, accepted: worktree children merge
+    individually and scratch children cannot edit a repo — isolation beats a
+    human approval gate.
     """
     from hermes_cli.kanban_db import (
         _new_task_id, _canonical_assignee, _append_event,
@@ -190,6 +236,10 @@ def _insert_decomposed_child(
         child_ws_path = child.get("workspace_path")
     elif child_ws_kind == "worktree":
         child_ws_path = None
+    elif child_ws_kind == "dir" and (root_row["status"] or "") == "triage":
+        # Implicit inheritance of the root's checkout: refuse it (see docstring).
+        anchor = _decompose_repo_anchor(root_row)
+        child_ws_kind, child_ws_path = ("worktree", anchor) if anchor else ("scratch", None)
     elif child_ws_kind == root_ws_kind:
         child_ws_path = root_row["workspace_path"]
     else:
