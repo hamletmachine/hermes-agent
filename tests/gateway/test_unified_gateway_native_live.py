@@ -30,11 +30,6 @@ import pytest
 from websockets.asyncio.client import connect
 
 ROOT = Path(__file__).resolve().parents[2]
-# Windows children need the system environment (Winsock, temp, PATHEXT) that the
-# hermetic test process still carries; POSIX only ever uses the first three.
-_CHILD_ENV_KEYS = ('PATH', 'LANG', 'TZ', 'SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR', 'COMSPEC', 'TEMP', 'TMP',
-                   'PATHEXT', 'LOCALAPPDATA', 'APPDATA', 'PROGRAMDATA', 'NUMBER_OF_PROCESSORS',
-                   'PROCESSOR_ARCHITECTURE')
 
 
 class Model(BaseHTTPRequestHandler):
@@ -285,7 +280,11 @@ def harness(tmp_path, peer):
         "        record('worker_error', reason=obj.get('reason'), traceback=traceback.format_exc())\n"
         "    return _dumps(obj, *a, **kw)\n"
         "_json.dumps = _dumps_witness\n", encoding='utf-8')
-    env = {k: os.environ[k] for k in _CHILD_ENV_KEYS if k in os.environ}
+    # One child-env policy for every live-daemon harness: the shared helper also
+    # forwards the suite's lazy-install kill-switch, so this daemon cannot sync a
+    # dependency environment into its disposable HERMES_HOME.
+    from tests.gateway.fixtures.local_recovery_probe import child_env
+    env = child_env()
     env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home), PYTHONUNBUFFERED='1',
                PYTHONPATH=os.pathsep.join([str(site), str(ROOT)]),
                OPENAI_API_KEY='loopback-only', OPENAI_BASE_URL=url)

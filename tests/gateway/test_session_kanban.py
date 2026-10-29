@@ -54,6 +54,15 @@ def test_claim_freezes_task_policy_and_rejects_forgery(tmp_path, monkeypatch):
         build_policy({'source': 'kanban', 'cwd': str(workspace)}, config)
 
 
+def test_dispatcher_probe_child_env_carries_lazy_install_switch(monkeypatch):
+    """The spawned dispatcher inherits the suite's install kill-switch, never a default."""
+    from tests.gateway.fixtures.local_recovery_probe import child_env
+    monkeypatch.setenv('HERMES_DISABLE_LAZY_INSTALLS', '1')
+    assert child_env()['HERMES_DISABLE_LAZY_INSTALLS'] == '1'
+    monkeypatch.delenv('HERMES_DISABLE_LAZY_INSTALLS')
+    assert 'HERMES_DISABLE_LAZY_INSTALLS' not in child_env()
+
+
 @pytest.mark.parametrize('mode', ['complete', 'timeout', 'rate_limit', 'billing', 'crash'])
 def test_real_dispatcher_lifecycle(tmp_path, mode):
     import os
@@ -66,6 +75,10 @@ def test_real_dispatcher_lifecycle(tmp_path, mode):
     result = subprocess.run([sys.executable, str(Path(__file__).parent / 'fixtures' / 'kanban_owner_probe.py')],
         env=env, cwd=repo, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=150, check=False)
     assert result.returncode == 0, result.stdout + result.stderr
+    # The disposable home must never receive a provisioned dependency environment:
+    # a child without the suite's lazy-install kill-switch syncs one on every boot
+    # (~945 MB per invocation, measured against a self-managed checkout).
+    assert not list((tmp_path / 'state' / 'installs').glob('*/environments/*/venv'))
     receipt = json.loads((tmp_path / 'state' / 'receipt.json').read_text())
     print(json.dumps(receipt))
     if mode != 'complete':
